@@ -1,0 +1,13 @@
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Данные MNIST (качаются скриптом, ~11 МБ)
+data/
+
+# Python
+__pycache__/
+*.pyc
