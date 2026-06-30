@@ -33,15 +33,86 @@ def _unbroadcast(grad, shape):
     return grad
 
 
+# --- im2col / col2im: ядро эффективной свёртки -------------------------------
+# Свёртка — это «приложить ядро к каждому окну изображения». Наивно это
+# вложенные циклы. Трюк im2col: вытащить ВСЕ окна и разложить их по столбцам
+# одной большой матрицы. Тогда свёртка превращается в одно матричное
+# умножение (его numpy/BLAS считают очень быстро). col2im — обратная операция,
+# нужна в backward, чтобы «разложить» градиент столбцов обратно по пикселям.
+
+def im2col(x, kh, kw, stride, pad):
+    """x: (N, C, H, W) -> матрица окон (N*out_h*out_w, C*kh*kw)."""
+    N, C, H, W = x.shape
+    out_h = (H + 2 * pad - kh) // stride + 1
+    out_w = (W + 2 * pad - kw) // stride + 1
+    xp = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
+
+    cols = np.zeros((N, C, kh, kw, out_h, out_w))
+    for i in range(kh):
+        i_max = i + stride * out_h
+        for j in range(kw):
+            j_max = j + stride * out_w
+            cols[:, :, i, j, :, :] = xp[:, :, i:i_max:stride, j:j_max:stride]
+
+    cols = cols.transpose(0, 4, 5, 1, 2, 3).reshape(N * out_h * out_w, -1)
+    return cols, out_h, out_w
+
+
+def col2im(cols, x_shape, kh, kw, stride, pad, out_h, out_w):
+    """Обратная к im2col: (N*out_h*out_w, C*kh*kw) -> (N, C, H, W)."""
+    N, C, H, W = x_shape
+    cols = cols.reshape(N, out_h, out_w, C, kh, kw).transpose(0, 3, 4, 5, 1, 2)
+    xp = np.zeros((N, C, H + 2 * pad, W + 2 * pad))
+    for i in range(kh):
+        i_max = i + stride * out_h
+        for j in range(kw):
+            j_max = j + stride * out_w
+            # += потому что одно и то же место входит в несколько окон.
+            xp[:, :, i:i_max:stride, j:j_max:stride] += cols[:, :, i, j, :, :]
+    return xp[:, :, pad:pad + H, pad:pad + W]
+
+
+# Глобальный переключатель построения графа. Когда выключен (режим no_grad),
+# операции не запоминают родителей и не заводят backward — так инференс не
+# держит в памяти весь граф и промежуточные карты сразу освобождаются.
+_grad_enabled = True
+
+
+class no_grad:
+    """Контекст инференса, как torch.no_grad():
+
+        with no_grad():
+            logits = model(x)   # граф не строится, память минимальна
+    """
+
+    def __enter__(self):
+        global _grad_enabled
+        self._prev = _grad_enabled
+        _grad_enabled = False
+
+    def __exit__(self, *exc):
+        global _grad_enabled
+        _grad_enabled = self._prev
+        return False
+
+
 class Tensor:
     """Узел графа: массив numpy + его градиент той же формы."""
 
     def __init__(self, data, _children=(), _op=""):
         self.data = np.asarray(data, dtype=np.float64)
-        self.grad = np.zeros_like(self.data)
+        # Под no_grad не аллоцируем grad (экономия памяти) и не держим детей.
+        self.grad = np.zeros_like(self.data) if _grad_enabled else None
         self._backward = lambda: None
-        self._prev = set(_children)
+        self._prev = set(_children) if _grad_enabled else set()
         self._op = _op
+
+    def _set_backward(self, fn):
+        # Регистрируем backward только если граф включён. Иначе замыкание
+        # нигде не сохраняется и тут же освобождается вместе со ссылками
+        # на входные тензоры — это и есть экономия памяти при инференсе.
+        if _grad_enabled:
+            self._backward = fn
 
     @property
     def shape(self):
@@ -58,7 +129,7 @@ class Tensor:
             self.grad += _unbroadcast(out.grad, self.data.shape)
             other.grad += _unbroadcast(out.grad, other.data.shape)
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def __mul__(self, other):
@@ -69,7 +140,7 @@ class Tensor:
             self.grad += _unbroadcast(other.data * out.grad, self.data.shape)
             other.grad += _unbroadcast(self.data * out.grad, other.data.shape)
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def matmul(self, other):
@@ -81,7 +152,7 @@ class Tensor:
             self.grad += out.grad @ other.data.T
             other.grad += self.data.T @ out.grad
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def __matmul__(self, other):
@@ -94,7 +165,7 @@ class Tensor:
             # производная: 1 там, где вход был > 0, иначе 0
             self.grad += (self.data > 0) * out.grad
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def tanh(self):
@@ -104,7 +175,7 @@ class Tensor:
         def _backward():
             self.grad += (1 - t ** 2) * out.grad
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def sigmoid(self):
@@ -115,7 +186,7 @@ class Tensor:
             # d/dx sigmoid = sigmoid * (1 - sigmoid)
             self.grad += s * (1 - s) * out.grad
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def transpose(self):
@@ -125,7 +196,7 @@ class Tensor:
         def _backward():
             self.grad += out.grad.T
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     @property
@@ -142,13 +213,91 @@ class Tensor:
                 grad = np.expand_dims(grad, axis)
             self.grad += np.ones_like(self.data) * grad
 
-        out._backward = _backward
+        out._set_backward(_backward)
         return out
 
     def mean(self, axis=None, keepdims=False):
         # mean = sum / N, поэтому переиспользуем sum и делим на число элементов.
         n = self.data.size if axis is None else self.data.shape[axis]
         return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
+
+    def reshape(self, *shape):
+        out = Tensor(self.data.reshape(*shape), (self,), "reshape")
+
+        def _backward():
+            # Просто возвращаем градиент к исходной форме.
+            self.grad += out.grad.reshape(self.data.shape)
+
+        out._set_backward(_backward)
+        return out
+
+    # --- Свёрточные операции ------------------------------------------------
+
+    def conv2d(self, weight, bias=None, stride=1, padding=0):
+        """Свёртка. self: (N, C_in, H, W), weight: (C_out, C_in, kh, kw).
+
+        Реализована через im2col: окна -> столбцы -> одно матричное умножение.
+        Градиенты текут и во вход (self), и в веса, и в смещение.
+        """
+        N, C_in, H, W = self.data.shape
+        C_out, _, kh, kw = weight.data.shape
+
+        cols, out_h, out_w = im2col(self.data, kh, kw, stride, padding)
+        W_row = weight.data.reshape(C_out, -1)          # (C_out, C_in*kh*kw)
+
+        out_data = cols @ W_row.T                        # (N*out_h*out_w, C_out)
+        if bias is not None:
+            out_data = out_data + bias.data
+        # вернуть форму (N, C_out, out_h, out_w)
+        out_data = out_data.reshape(N, out_h, out_w, C_out).transpose(0, 3, 1, 2)
+
+        children = (self, weight) if bias is None else (self, weight, bias)
+        out = Tensor(out_data, children, "conv2d")
+
+        def _backward():
+            # dout в форму столбцов: (N*out_h*out_w, C_out)
+            dout = out.grad.transpose(0, 2, 3, 1).reshape(-1, C_out)
+            if bias is not None:
+                bias.grad += dout.sum(axis=0)
+            # градиент весов: dW = colsᵀ @ dout
+            weight.grad += (cols.T @ dout).T.reshape(weight.data.shape)
+            # градиент входа: раскладываем dcols обратно по пикселям через col2im
+            dcols = dout @ W_row
+            self.grad += col2im(dcols, self.data.shape, kh, kw,
+                                stride, padding, out_h, out_w)
+
+        out._set_backward(_backward)
+        return out
+
+    def maxpool2d(self, kernel=2, stride=None):
+        """Max-pooling. self: (N, C, H, W). Берёт максимум в каждом окне kxk.
+
+        Для простоты поддержан типичный случай: stride == kernel, без паддинга
+        и H, W кратны kernel. Уменьшает карту вдвое (при kernel=2), оставляя
+        самые сильные отклики и делая сеть устойчивой к сдвигам.
+        """
+        k = kernel
+        s = stride or kernel
+        assert s == k, "поддержан только stride == kernel"
+        N, C, H, W = self.data.shape
+        assert H % k == 0 and W % k == 0, "H и W должны делиться на kernel"
+        out_h, out_w = H // k, W // k
+
+        # Разрезаем на окна kxk и берём максимум по ним.
+        x = self.data.reshape(N, C, out_h, k, out_w, k)
+        out_data = x.max(axis=(3, 5))
+        out = Tensor(out_data, (self,), "maxpool2d")
+
+        def _backward():
+            # Градиент идёт только в ту ячейку окна, где был максимум.
+            mask = (x == out_data[:, :, :, None, :, None])
+            # если в окне несколько одинаковых максимумов — делим поровну
+            mask = mask / mask.sum(axis=(3, 5), keepdims=True)
+            grad = out.grad[:, :, :, None, :, None] * mask
+            self.grad += grad.reshape(N, C, H, W)
+
+        out._set_backward(_backward)
+        return out
 
     def softmax_cross_entropy(self, targets):
         """Совмещённые softmax + кросс-энтропия -> скаляр-loss.
@@ -179,7 +328,7 @@ class Tensor:
             grad /= N                             # усреднение по батчу
             self.grad += grad * out.grad          # out.grad обычно = 1
 
-        out._backward = _backward
+        out._set_backward(_backward)
         # probs пригодятся снаружи для подсчёта точности
         out.probs = probs
         return out

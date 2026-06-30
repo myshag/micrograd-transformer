@@ -11,7 +11,7 @@ import numpy as np
 
 import nn
 import optim
-from tensor import Tensor
+from tensor import Tensor, no_grad
 
 
 # --- Данные -----------------------------------------------------------------
@@ -40,10 +40,11 @@ def build_model():
 
 def accuracy(model, x, y, batch=1000):
     correct = 0
-    for i in range(0, len(x), batch):
-        logits = model(Tensor(x[i:i + batch]))
-        pred = logits.data.argmax(axis=1)
-        correct += (pred == y[i:i + batch]).sum()
+    with no_grad():                       # инференс без построения графа
+        for i in range(0, len(x), batch):
+            logits = model(Tensor(x[i:i + batch]))
+            pred = logits.data.argmax(axis=1)
+            correct += (pred == y[i:i + batch]).sum()
     return correct / len(x)
 
 

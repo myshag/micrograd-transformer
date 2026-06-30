@@ -95,6 +95,47 @@ class Linear(Module):
         return out
 
 
+class Conv2d(Module):
+    """torch.nn.Conv2d: свёрточный слой.
+
+    weight: (out_channels, in_channels, kernel, kernel) — как в PyTorch.
+    Вход и выход — карты признаков формы (N, C, H, W).
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, bias=True, seed=None):
+        rng = np.random.default_rng(seed)
+        k = kernel_size
+        # Инициализация как в PyTorch: ±1/√(in_channels·k·k).
+        bound = 1.0 / np.sqrt(in_channels * k * k)
+        self.weight = Tensor(
+            rng.uniform(-bound, bound, (out_channels, in_channels, k, k)))
+        self.bias = Tensor(rng.uniform(-bound, bound, out_channels)) if bias else None
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x):
+        return x.conv2d(self.weight, self.bias, self.stride, self.padding)
+
+
+class MaxPool2d(Module):
+    """torch.nn.MaxPool2d: уменьшает карту, беря максимум в окнах kxk."""
+
+    def __init__(self, kernel_size=2, stride=None):
+        self.kernel_size = kernel_size
+        self.stride = stride
+
+    def forward(self, x):
+        return x.maxpool2d(self.kernel_size, self.stride)
+
+
+class Flatten(Module):
+    """torch.nn.Flatten: (N, C, H, W) -> (N, C*H*W) перед полносвязным слоём."""
+
+    def forward(self, x):
+        return x.reshape(x.shape[0], -1)
+
+
 class ReLU(Module):
     def forward(self, x):
         return x.relu()
