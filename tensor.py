@@ -97,6 +97,59 @@ class Tensor:
         out._backward = _backward
         return out
 
+    def tanh(self):
+        t = np.tanh(self.data)
+        out = Tensor(t, (self,), "tanh")
+
+        def _backward():
+            self.grad += (1 - t ** 2) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def sigmoid(self):
+        s = 1 / (1 + np.exp(-self.data))
+        out = Tensor(s, (self,), "sigmoid")
+
+        def _backward():
+            # d/dx sigmoid = sigmoid * (1 - sigmoid)
+            self.grad += s * (1 - s) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def transpose(self):
+        """Транспонирование. Нужно линейному слою (веса хранятся как (out, in))."""
+        out = Tensor(self.data.T, (self,), "T")
+
+        def _backward():
+            self.grad += out.grad.T
+
+        out._backward = _backward
+        return out
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    def sum(self, axis=None, keepdims=False):
+        out = Tensor(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum")
+
+        def _backward():
+            # Градиент суммы — единица в каждую ячейку входа (с учётом формы).
+            grad = out.grad
+            if axis is not None and not keepdims:
+                grad = np.expand_dims(grad, axis)
+            self.grad += np.ones_like(self.data) * grad
+
+        out._backward = _backward
+        return out
+
+    def mean(self, axis=None, keepdims=False):
+        # mean = sum / N, поэтому переиспользуем sum и делим на число элементов.
+        n = self.data.size if axis is None else self.data.shape[axis]
+        return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
+
     def softmax_cross_entropy(self, targets):
         """Совмещённые softmax + кросс-энтропия -> скаляр-loss.
 

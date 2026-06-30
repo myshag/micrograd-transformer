@@ -13,7 +13,12 @@
 **Часть 2 — тензорный движок + MNIST (практика):**
 - `tensor.py` — тот же autograd, но узлы графа — матрицы numpy (класс `Tensor`)
 - `download_mnist.py` — скачивает датасет в `data/mnist.npz`
-- `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох (~15 c)
+- `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох
+
+**Часть 3 — API, базово совместимый с PyTorch:**
+- `nn.py` — `Module`, `Linear`, `ReLU`/`Tanh`/`Sigmoid`, `Sequential`, `CrossEntropyLoss`
+- `optim.py` — оптимизаторы: `SGD` (с моментом) и `Adam`
+- `api_demo.py` — тот же код, что и на PyTorch (кастомный `Module`, `state_dict`, …)
 
 ## Запуск
 ```bash
@@ -22,6 +27,8 @@ python3 demo.py                 # часть 1: теория на маленьк
 python3 -m pip install --user numpy
 python3 download_mnist.py       # часть 2: скачать данные (~11 МБ)
 python3 mnist.py                # обучить сеть на MNIST
+
+python3 api_demo.py             # часть 3: API в стиле PyTorch
 ```
 
 ---
@@ -144,8 +151,50 @@ C = A @ B   →   dA = dC @ Bᵀ ,   dB = Aᵀ @ dC
 
 ---
 
+## Часть 3: API, базово совместимый с PyTorch
+
+Цель — чтобы код модели выглядел **как настоящий PyTorch**, и обычный
+туториал по torch переносился почти дословно. Совпадают:
+
+| что | как в PyTorch и у нас |
+|-----|----------------------|
+| слой | `nn.Linear(in, out)`, атрибуты `weight`, `bias` |
+| форма весов | `(out_features, in_features)`, forward `x @ weight.T + bias` |
+| контейнер | `nn.Sequential(...)`, либо подкласс `nn.Module` с `forward` |
+| функция потерь | `criterion = nn.CrossEntropyLoss(); loss = criterion(logits, y)` |
+| оптимизатор | `optim.SGD(model.parameters(), lr, momentum)` / `optim.Adam(...)` |
+| цикл шага | `zero_grad()` → `loss.backward()` → `step()` |
+| веса | `model.state_dict()` / `load_state_dict()`, `named_parameters()` |
+
+Один и тот же код запускается на нашем движке и на настоящем torch —
+отличаются только строки `import` (см. шапку `api_demo.py`):
+
+```python
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(784, 128)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(128, 10)
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+logits = model(x)
+loss = criterion(logits, y)
+optimizer.zero_grad(); loss.backward(); optimizer.step()
+```
+
+Под капотом вместо `torch.Tensor` работает наш `Tensor`, а градиенты считает
+наш autograd. Корректность операций (`matmul`, `transpose`, `sum`, `mean`,
+`tanh`, `sigmoid`) подтверждена численной проверкой градиента (расхождение ~1e-10).
+
+---
+
 ## Что дальше можно добавить
-- больше слоёв / операций: `sigmoid`, `tanh`, dropout, batchnorm
-- оптимизатор получше: SGD с моментом, Adam
-- свёрточный слой (conv2d) — заметный прирост точности на MNIST
-- мини-API в стиле PyTorch: `nn.Linear`, `optim.SGD`
+- свёрточный слой (`conv2d`) — заметный прирост точности на MNIST (~99%)
+- регуляризация: dropout, batchnorm (для них уже есть `model.train()/eval()`)
+- больше из API torch: `nn.Module.to()`, загрузка реальных `state_dict`
