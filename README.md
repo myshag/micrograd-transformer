@@ -26,6 +26,13 @@
 - `mnist_conv.py` — CNN, **~97–99%** на MNIST
 - режим `no_grad` (как `torch.no_grad()`) — инференс без построения графа
 
+**Часть 5 — трансформер с нуля:**
+- `tensor.py` — `softmax`, батчевый `matmul`, `swapaxes`/`mT`, `__pow__`, эмбеддинги
+- `nn.py` — `Embedding`, `LayerNorm`, `MultiheadAttention`,
+  `TransformerEncoderLayer`, `TransformerEncoder` (+ каузальный маск)
+- `primes.py` — мини-GPT, который **генерирует простые числа**
+- 📘 **`docs/transformer-from-scratch.md`** — учебник: трансформер с нуля
+
 ## Запуск
 ```bash
 python3 demo.py                 # часть 1: теория на маленьких примерах
@@ -36,6 +43,7 @@ python3 mnist.py                # обучить сеть на MNIST
 
 python3 api_demo.py             # часть 3: API в стиле PyTorch
 python3 mnist_conv.py           # часть 4: свёрточная сеть (CNN)
+python3 primes.py               # часть 5: трансформер генерирует простые числа
 ```
 
 ---

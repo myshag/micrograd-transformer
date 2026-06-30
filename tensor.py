@@ -144,13 +144,21 @@ class Tensor:
         return out
 
     def matmul(self, other):
-        """Матричное умножение self @ other — основа линейного слоя."""
+        """Матричное умножение self @ other.
+
+        Поддерживает батчи (любые ведущие оси, как в numpy): нужно для
+        multi-head attention, где тензоры имеют форму (B, heads, T, d).
+        """
         out = Tensor(self.data @ other.data, (self, other), "@")
 
         def _backward():
-            # Для C = A @ B:  dA = dC @ B^T,  dB = A^T @ dC
-            self.grad += out.grad @ other.data.T
-            other.grad += self.data.T @ out.grad
+            # Для C = A @ B:  dA = dC @ Bᵀ,  dB = Aᵀ @ dC.
+            # Транспонируем только две последние оси (батчи не трогаем),
+            # а _unbroadcast сворачивает оси, размноженные broadcasting'ом.
+            ga = out.grad @ np.swapaxes(other.data, -1, -2)
+            gb = np.swapaxes(self.data, -1, -2) @ out.grad
+            self.grad += _unbroadcast(ga, self.data.shape)
+            other.grad += _unbroadcast(gb, other.data.shape)
 
         out._set_backward(_backward)
         return out
@@ -202,6 +210,65 @@ class Tensor:
     @property
     def T(self):
         return self.transpose()
+
+    def swapaxes(self, axis1, axis2):
+        """Поменять местами две оси (для перестановки голов в attention)."""
+        out = Tensor(np.swapaxes(self.data, axis1, axis2), (self,), "swapaxes")
+
+        def _backward():
+            self.grad += np.swapaxes(out.grad, axis1, axis2)
+
+        out._set_backward(_backward)
+        return out
+
+    @property
+    def mT(self):
+        """Транспонирование двух последних осей — для Q @ Kᵀ в attention."""
+        return self.swapaxes(-1, -2)
+
+    def __pow__(self, p):
+        """Возведение в постоянную степень (нужно для LayerNorm: √, 1/x)."""
+        out = Tensor(self.data ** p, (self,), f"**{p}")
+
+        def _backward():
+            self.grad += (p * self.data ** (p - 1)) * out.grad
+
+        out._set_backward(_backward)
+        return out
+
+    def __truediv__(self, other):
+        if isinstance(other, Tensor):
+            return self * other ** -1
+        return self * (1.0 / other)
+
+    def __rtruediv__(self, other):
+        return (self ** -1) * other
+
+    def softmax(self, axis=-1):
+        """Softmax вдоль оси — превращает «сырые» оценки в веса внимания."""
+        z = self.data - self.data.max(axis=axis, keepdims=True)
+        e = np.exp(z)
+        p = e / e.sum(axis=axis, keepdims=True)
+        out = Tensor(p, (self,), "softmax")
+
+        def _backward():
+            # Якобиан softmax: dx = p ⊙ (g − Σ(g⊙p)).
+            s = (out.grad * p).sum(axis=axis, keepdims=True)
+            self.grad += p * (out.grad - s)
+
+        out._set_backward(_backward)
+        return out
+
+    def index_rows(self, idx):
+        """Выбрать строки по индексам (основа Embedding). idx — numpy-массив."""
+        out = Tensor(self.data[idx], (self,), "embed")
+
+        def _backward():
+            # Несколько позиций могут ссылаться на одну строку — копим через add.at.
+            np.add.at(self.grad, idx, out.grad)
+
+        out._set_backward(_backward)
+        return out
 
     def sum(self, axis=None, keepdims=False):
         out = Tensor(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum")
