@@ -384,6 +384,19 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
+    def __getitem__(self, key):
+        """Срез/индексация x[key] — дифференцируемая. Градиент рассеивается
+        обратно в нулевой массив исходной формы по тем же позициям."""
+        out = Tensor(self.data[key], (self,), "getitem")
+
+        def _backward():
+            g = np.zeros_like(self.data)
+            g[key] += out.grad          # верно для срезов (позиции различны)
+            self.grad += g
+
+        out._set_backward(_backward)
+        return out
+
     # --- Свёрточные операции ------------------------------------------------
 
     def conv2d(self, weight, bias=None, stride=1, padding=0):
@@ -531,3 +544,20 @@ class Tensor:
     def __repr__(self):
         dev = "" if self.device == "cpu" else f", device='{self.device}'"
         return f"Tensor(shape={self.data.shape}{dev})"
+
+
+def cat(tensors, axis=0):
+    """Конкатенация тензоров вдоль оси — дифференцируемая. Градиент разрезается
+    обратно по кускам исходных форм (нужно, например, для RoPE)."""
+    tensors = list(tensors)
+    out = Tensor(np.concatenate([t.data for t in tensors], axis=axis),
+                 tuple(tensors), "cat")
+
+    def _backward():
+        sizes = [t.data.shape[axis] for t in tensors]
+        splits = np.cumsum(sizes)[:-1]
+        for t, g in zip(tensors, np.split(out.grad, splits, axis=axis)):
+            t.grad += g
+
+    out._set_backward(_backward)
+    return out
