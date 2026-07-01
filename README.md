@@ -67,6 +67,8 @@
 - `rl_demo.py` — REINFORCE вживую на 3 сэмплах: как награда двигает log π
 - `rl_pythia.py` — **RL-дообучение НАСТОЯЩЕЙ LLM (Pythia-70M)** на нашем движке:
   замороженное тело + REINFORCE на голове; выход сдвигается за pretrain
+- `math_rl.py` — **RLVR: математика-судья**. Модель учится (a+b) mod 10 из
+  проверяемой награды (GRPO + entropy-бонус); наглядно про коллапс и exploration
 - `primes.py` — мини-GPT, который **генерирует простые числа**
 - `primes_memorize.py` — 100% train через запоминание (урок про overfitting)
 - `attention_viz.py` — тепловая карта матрицы внимания softmax(QKᵀ)

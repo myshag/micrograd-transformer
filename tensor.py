@@ -322,6 +322,15 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
+    def log(self):
+        out = Tensor(np.log(self.data), (self,), "log")
+
+        def _backward():
+            self.grad += (1.0 / self.data) * out.grad
+
+        out._set_backward(_backward)
+        return out
+
     def __truediv__(self, other):
         if isinstance(other, Tensor):
             return self * other ** -1
