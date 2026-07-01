@@ -168,6 +168,109 @@ def generate_c(root, reps=None, profile=False, fuse=False):
     return "\n".join(headers + decls + main + [""])
 
 
+def _fwd_stmt(n, idx):
+    """C-инструкция forward для одного узла (без слияния — буферы сохраняются)."""
+    op, ins = n._op, n._inputs
+    a = idx[ins[0]]
+    if op == "@":
+        M, K = ins[0].data.shape
+        _, N = ins[1].data.shape
+        return (f"cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,"
+                f"{M},{N},{K},1.0f,t{a},{K},t{idx[ins[1]]},{N},0.0f,t{idx[n]},{N});")
+    if op == "+":
+        b, sz = idx[ins[1]], n.data.size
+        if ins[1].data.ndim == 1:
+            return f"for(int i=0;i<{sz};i++) t{idx[n]}[i]=t{a}[i]+t{b}[i%{ins[1].data.shape[0]}];"
+        return f"for(int i=0;i<{sz};i++) t{idx[n]}[i]=t{a}[i]+t{b}[i];"
+    if op == "relu":
+        return f"for(int i=0;i<{n.data.size};i++){{float x=t{a}[i];t{idx[n]}[i]=x>0?x:0;}}"
+    if op == "tanh":
+        return f"for(int i=0;i<{n.data.size};i++) t{idx[n]}[i]=tanhf(t{a}[i]);"
+    raise ValueError(op)
+
+
+def _bwd_stmts(n, idx):
+    """C-инструкции backward: раздать градиент g{n} входам узла (с накоплением)."""
+    op, ins = n._op, n._inputs
+    gn = f"g{idx[n]}"
+    if op == "@":
+        X, W = ins
+        M, K = X.data.shape          # X: (M,K),  W: (K,N),  out: (M,N)
+        _, N = W.data.shape
+        # dX += dZ @ Wᵀ ;  dW += Xᵀ @ dZ  — оба через sgemm с транспонированием
+        return [
+            f"cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,{M},{K},{N},"
+            f"1.0f,{gn},{N},t{idx[W]},{N},1.0f,g{idx[X]},{K});",
+            f"cblas_sgemm(CblasRowMajor,CblasTrans,CblasNoTrans,{K},{N},{M},"
+            f"1.0f,t{idx[X]},{K},{gn},{N},1.0f,g{idx[W]},{N});"]
+    if op == "+":
+        A, B = ins
+        sz = n.data.size
+        out = [f"for(int i=0;i<{sz};i++) g{idx[A]}[i]+={gn}[i];"]
+        if B.data.ndim == 1:         # смещение: db[j] = сумма по строкам
+            out.append(f"for(int i=0;i<{sz};i++) g{idx[B]}[i%{B.data.shape[0]}]+={gn}[i];")
+        else:
+            out.append(f"for(int i=0;i<{sz};i++) g{idx[B]}[i]+={gn}[i];")
+        return out
+    if op == "relu":                 # маска по forward-выходу (relu>0 <=> вход>0)
+        return [f"for(int i=0;i<{n.data.size};i++) "
+                f"g{idx[ins[0]]}[i]+=(t{idx[n]}[i]>0?1.0f:0.0f)*{gn}[i];"]
+    if op == "tanh":                 # d/dx = 1 - tanh(x)^2
+        return [f"for(int i=0;i<{n.data.size};i++) "
+                f"g{idx[ins[0]]}[i]+=(1.0f-t{idx[n]}[i]*t{idx[n]}[i])*{gn}[i];"]
+    raise ValueError(op)
+
+
+def generate_backward_c(root, named):
+    """C-исходник: forward + backward графа, печать градиентов листьев `named`.
+
+    named: dict {имя: Tensor-лист}. Выходной градиент засевается единицами
+    (как self.grad = ones в нашем backward).
+    """
+    topo = topo_sort(root)
+    idx = {n: i for i, n in enumerate(topo)}
+
+    decls, fwd, bwd = [], [], []
+    for n in topo:
+        size = max(1, int(np.prod(n.data.shape)))
+        if not n._inputs:
+            vals = ", ".join(f"{float(x):.9g}f" for x in n.data.ravel(order="C"))
+            decls.append(f"static float t{idx[n]}[{size}] = {{ {vals} }};")
+        else:
+            decls.append(f"static float t{idx[n]}[{size}];")
+            fwd.append(_fwd_stmt(n, idx))
+        decls.append(f"static float g{idx[n]}[{size}];")   # градиент (0 по умолч.)
+
+    # backward: засеять выход и пройти в обратном топологическом порядке
+    bwd.append(f"for(int i=0;i<{root.data.size};i++) g{idx[root]}[i]=1.0f;")
+    for n in reversed(topo):
+        if n._inputs:
+            bwd += _bwd_stmts(n, idx)
+
+    prints = []
+    for name, node in named.items():
+        prints.append(f'  printf("{name}");')
+        prints.append(f'  for(int i=0;i<{node.data.size};i++) printf(" %.7g", g{idx[node]}[i]);')
+        prints.append('  printf("\\n");')
+
+    return "\n".join(
+        ["#include <stdio.h>", "#include <math.h>", "#include <cblas.h>"]
+        + decls + ["int main(void){"]
+        + [f"  {s}" for s in fwd] + [f"  {s}" for s in bwd] + prints
+        + ["  return 0;", "}", ""])
+
+
+def compile_backward(root, named):
+    """Скомпилировать backward в C+BLAS, вернуть {имя: numpy-градиент}."""
+    src = generate_backward_c(root, named)
+    out = subprocess.run([_build(src)], capture_output=True, text=True, check=True).stdout
+    grads = {}
+    for line in out.strip().splitlines():
+        parts = line.split()
+        grads[parts[0]] = np.array([float(x) for x in parts[1:]], dtype=np.float32)
+    return grads, src
+
+
 def _build(src):
     tmp = tempfile.mkdtemp()
     cpath, epath = os.path.join(tmp, "g.c"), os.path.join(tmp, "g")
@@ -296,8 +399,41 @@ def fusion_demo():
           "OK ✓" if d2 < 1e-3 else "РАСХОЖДЕНИЕ ✗")
 
 
+def backward_demo():
+    """Скомпилировать backward в C+BLAS и сверить градиенты с Python autograd."""
+    rng = np.random.default_rng(2)
+    X = Tensor(rng.standard_normal((6, 12)))
+    W1 = Tensor(rng.standard_normal((12, 20))); b1 = Tensor(rng.standard_normal(20))
+    W2 = Tensor(rng.standard_normal((20, 5)));  b2 = Tensor(rng.standard_normal(5))
+    Y = (X @ W1 + b1).relu() @ W2 + b2
+    named = {"X": X, "W1": W1, "b1": b1, "W2": W2, "b2": b2}
+
+    # 1) сначала компилируем backward в C (граф ещё цел)
+    c_grads, src = compile_backward(Y, named)
+
+    # 2) затем Python autograd (backward освобождает граф — поэтому после C)
+    Y.backward()
+    py_grads = {k: v.grad.ravel() for k, v in named.items()}
+
+    print("=== Backward: сверка C+BLAS с Python autograd ===")
+    print("Фрагмент сгенерированного backward (градиенты matmul — тоже sgemm):")
+    for line in src.splitlines():
+        if "CblasTrans" in line:
+            print("  " + line.strip())
+    print()
+    worst = 0.0
+    for k in named:
+        d = np.abs(py_grads[k] - c_grads[k]).max()
+        worst = max(worst, d)
+        print(f"  grad {k:3s}: max|py - C| = {d:.2e}")
+    print("\nИтог:", "OK ✓" if worst < 1e-3 else "РАСХОЖДЕНИЕ ✗",
+          f"(худшее расхождение {worst:.2e}, точность float32)")
+
+
 if __name__ == "__main__":
     demo()
     bench()
     fusion_demo()
     profile()
+    print()
+    backward_demo()
