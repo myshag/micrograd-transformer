@@ -27,6 +27,8 @@
   все градиенты сверены с autograd до `~5e-7`
 - `trace_demo.py` — как «захват графа» = просто вызвать функцию (трассировка,
   разворот циклов, специализация ветвлений — почему нам не нужен Dynamo)
+- `cuda_sim_demo.py` — CUDA-кернелы (matmul, fused +bias→relu) в симуляторе
+  Numba (`NUMBA_ENABLE_CUDASIM=1`) — «GPU-код без GPU», сверен с numpy
 - `download_mnist.py` — скачивает датасет в `data/mnist.npz`
 - `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох
 
