@@ -1030,6 +1030,14 @@ cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans, T,DH,T, 1, sc,T, V+h*DH,D, 
 `~7e-7` — то есть побитово с точностью float32. Тот самый трансформер из части 5,
 только теперь его forward — самостоятельный C с вызовами BLAS.
 
+И **backward** блока тоже компилируется (`transformer_c_backward.py`): градиент
+через FFN, LayerNorm, softmax и multi-head attention. Правила из главы 1, только
+на матрицах: градиент matmul — снова matmul с транспонированием, softmax
+backward `gs = p·(gp − Σ gp·p)`, LayerNorm backward по стандартной формуле.
+Все градиенты (по входу и по всем весам) совпадают с Python-autograd до `~5e-7`.
+Так что и forward, и backward целого блока трансформера — это статический C с
+вызовами BLAS.
+
 ---
 
 ## Глава 11. Упражнения
