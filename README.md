@@ -63,6 +63,8 @@
 - `tensor.py` — `softmax`, батчевый `matmul`, `swapaxes`/`mT`, `__pow__`, эмбеддинги
 - `nn.py` — `Embedding`, `LayerNorm`, `MultiheadAttention`,
   `TransformerEncoderLayer`, `TransformerEncoder` (+ каузальный маск)
+- `rl.py` — **RL-дообучение LM (REINFORCE / policy gradient)** — основа RLHF
+- `rl_demo.py` — REINFORCE вживую на 3 сэмплах: как награда двигает log π
 - `primes.py` — мини-GPT, который **генерирует простые числа**
 - `primes_memorize.py` — 100% train через запоминание (урок про overfitting)
 - `attention_viz.py` — тепловая карта матрицы внимания softmax(QKᵀ)
