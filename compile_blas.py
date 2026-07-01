@@ -286,7 +286,7 @@ def compile_backward(root, named):
     """Скомпилировать backward в C+BLAS, вернуть {имя: numpy-градиент}."""
     data = _data_file(root)
     src = generate_backward_c(root, named, data_path=data)
-    out = subprocess.run([_build(src)], capture_output=True, text=True, check=True).stdout
+    out = _exec(_build(src))
     grads = {}
     for line in out.strip().splitlines():
         parts = line.split()
@@ -294,12 +294,43 @@ def compile_backward(root, named):
     return grads, src
 
 
+# Выбор BLAS-библиотеки для линковки (тот же cblas_sgemm, разная реализация).
+_blas_link = ["-lopenblas"]
+_ld_dir = None
+
+
+def use_mkl(lib=None):
+    """Линковать сгенерированный C с Intel MKL вместо OpenBLAS (нужен pip mkl)."""
+    global _blas_link, _ld_dir
+    if lib is None:
+        import glob
+        cands = glob.glob(os.path.expanduser("~/.local/lib/libmkl_rt.so*"))
+        if not cands:
+            raise RuntimeError("libmkl_rt не найдена (pip install --user mkl)")
+        lib = cands[0]
+    _blas_link, _ld_dir = [lib], os.path.dirname(lib)
+
+
+def use_openblas():
+    global _blas_link, _ld_dir
+    _blas_link, _ld_dir = ["-lopenblas"], None
+
+
 def _build(src):
     tmp = tempfile.mkdtemp()
     cpath, epath = os.path.join(tmp, "g.c"), os.path.join(tmp, "g")
     open(cpath, "w").write(src)
-    subprocess.run(["gcc", "-O2", "-o", epath, cpath, "-lopenblas", "-lm"], check=True)
+    subprocess.run(["gcc", "-O2", "-o", epath, cpath, *_blas_link, "-lm"], check=True)
     return epath
+
+
+def _exec(epath):
+    """Запустить бинарник (с LD_LIBRARY_PATH для MKL), вернуть stdout."""
+    env = dict(os.environ)
+    if _ld_dir:
+        env["LD_LIBRARY_PATH"] = _ld_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+    return subprocess.run([epath], capture_output=True, text=True,
+                          check=True, env=env).stdout
 
 
 def _data_file(root):
@@ -313,7 +344,7 @@ def compile_and_run(root, fuse=False):
     """Скомпилировать граф в C (с BLAS), запустить, вернуть выход как numpy-массив."""
     data = _data_file(root)
     src = generate_c(root, fuse=fuse, data_path=data)
-    out = subprocess.run([_build(src)], capture_output=True, text=True, check=True).stdout
+    out = _exec(_build(src))
     arr = np.array([float(x) for x in out.split()], dtype=np.float32)
     return arr.reshape(root.data.shape), src
 
@@ -321,17 +352,14 @@ def compile_and_run(root, fuse=False):
 def compile_and_time(root, reps, fuse=False):
     """Скомпилировать и замерить среднее время forward в C (мс/проход)."""
     data = _data_file(root)
-    out = subprocess.run([_build(generate_c(root, reps, fuse=fuse, data_path=data))],
-                         capture_output=True, text=True, check=True).stdout
+    out = _exec(_build(generate_c(root, reps, fuse=fuse, data_path=data)))
     return float(out.split()[0])
 
 
 def compile_and_profile(root, reps, fuse=False):
     """Скомпилировать с таймером вокруг каждой операции; вернуть текст-разбивку."""
     data = _data_file(root)
-    out = subprocess.run([_build(generate_c(root, reps, profile=True, fuse=fuse,
-                                            data_path=data))],
-                         capture_output=True, text=True, check=True).stdout
+    out = _exec(_build(generate_c(root, reps, profile=True, fuse=fuse, data_path=data)))
     return out
 
 
