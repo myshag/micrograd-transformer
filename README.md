@@ -10,6 +10,7 @@
 - `autograd.py` — движок на одиночных числах (класс `Value`)
 - `demo.py` — примеры: проверка градиентов, нейрон, градиентный спуск
 - `autograd_graph.py` — печать графа вычислений деревом + трассировка backward
+- `compile_graph.py` — **компиляция графа в C**: forward+backward → gcc → сверка
 
 **Часть 2 — тензорный движок + MNIST (практика):**
 - `tensor.py` — тот же autograd, но узлы графа — матрицы numpy (класс `Tensor`)
@@ -43,6 +44,7 @@
 ```bash
 python3 demo.py                 # часть 1: теория на маленьких примерах
 python3 autograd_graph.py       # часть 1: граф вычислений деревом
+python3 compile_graph.py        # часть 1: компиляция графа в C (нужен gcc)
 
 python3 -m pip install --user numpy
 python3 download_mnist.py       # часть 2: скачать данные (~11 МБ)
