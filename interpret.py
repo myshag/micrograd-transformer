@@ -81,21 +81,59 @@ def scatter(pts, labels, w=68, h=22):
     return "\n".join("".join(r) for r in grid)
 
 
-def emb_map(P, tok):
-    groups = {
-        "звери": [" cat", " dog", " lion", " horse", " bird"],
-        "числа": [" one", " two", " three", " four", " five"],
-        "цвета": [" red", " blue", " green", " black", " white"],
-        "страны": [" France", " Germany", " China", " Japan", " Russia"],
-    }
-    words, labels = [], []
-    for g, ws in groups.items():
+EMB_GROUPS = {
+    "звери": [" cat", " dog", " lion", " horse", " bird"],
+    "числа": [" one", " two", " three", " four", " five"],
+    "цвета": [" red", " blue", " green", " black", " white"],
+    "страны": [" France", " Germany", " China", " Japan", " Russia"],
+}
+
+
+def _emb_points(P, tok):
+    words, labels, groups = [], [], []
+    for g, ws in EMB_GROUPS.items():
         for wd in ws:
             words.append(tok(wd, add_special_tokens=False)["input_ids"][0])
-            labels.append(wd)
+            labels.append(wd.strip())
+            groups.append(g)
     E = P["gpt_neox.embed_in.weight"].data[words]         # (N, hid)
+    return pca2(E), labels, groups
+
+
+def emb_map(P, tok):
+    pts, labels, _ = _emb_points(P, tok)
     print("=== 1. Эмбеддинги в 2D (PCA). Похожие слова должны быть рядом ===")
-    print(scatter(pca2(E), labels))
+    print(scatter(pts, labels))
+
+
+def emb_map_png(P, tok, path="docs/images/emb_pca.png"):
+    """Настоящая картинка PCA-проекции: цветные кластеры категорий с подписями."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pts, labels, groups = _emb_points(P, tok)
+    colors = {"звери": "#e4572e", "числа": "#17a398",
+              "цвета": "#4059ad", "страны": "#8e44ad"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
+    seen = set()
+    for (x, y), lab, g in zip(pts, labels, groups):
+        ax.scatter(x, y, c=colors[g], s=90, zorder=3,
+                   label=g if g not in seen else None)
+        seen.add(g)
+        ax.annotate(lab, (x, y), textcoords="offset points",
+                    xytext=(6, 4), fontsize=9)
+    ax.set_title("Эмбеддинги Pythia-70M в 2D (PCA)\nкластеры возникли сами из предсказания токена")
+    ax.set_xlabel("главная компонента 1")
+    ax.set_ylabel("главная компонента 2")
+    ax.legend(loc="best", framealpha=0.9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"=== 1b. PNG PCA-проекции сохранён: {path} ===")
 
 
 # --- 2. Карта внимания -------------------------------------------------------
@@ -198,6 +236,7 @@ def main():
     P = pythia.load_params()
     tok = AutoTokenizer.from_pretrained(pythia.MODEL)
     emb_map(P, tok)
+    emb_map_png(P, tok)
     attention_map(P, tok)
     logit_lens(P, tok)
     token_journey(P, tok)
