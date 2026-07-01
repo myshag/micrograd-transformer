@@ -22,6 +22,8 @@
 - `device_demo.py` — параметр `device` в стиле PyTorch (диспетч бэкенда, cpu↔cuda)
 - `torch_compare.py` — **сверка с PyTorch** (оракул): точность (градиенты `~1e-8`)
   и скорость (PyTorch ~2.8× быстрее на CPU)
+- `jit_compare.py` — наш C+BLAS vs PyTorch eager vs `torch.compile` (native-код
+  закрывает разрыв; JIT окупается только на масштабе)
 - `multi_gpu_demo.py` — **мульти-GPU**: `cuda:0`/`cuda:1`, перенос `.to()`, model parallelism
 - `parallel.py` — **современный мульти-GPU параллелизм**: ring all-reduce (NCCL),
   data parallel (DDP), tensor parallel (Megatron), pipeline (GPipe),
