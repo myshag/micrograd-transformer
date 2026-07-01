@@ -21,6 +21,8 @@
 - `kernels.cu` — настоящие CUDA C ядра (для `RealCudaBackend`; нужен GPU+CuPy)
 - `device_demo.py` — параметр `device` в стиле PyTorch (диспетч бэкенда, cpu↔cuda)
 - `multi_gpu_demo.py` — **мульти-GPU**: `cuda:0`/`cuda:1`, перенос `.to()`, model parallelism
+- `parallel.py` — **современный мульти-GPU параллелизм**: ring all-reduce (NCCL),
+  data parallel (DDP), tensor parallel (Megatron), pipeline (GPipe) — сверены с эталоном
 - `tensor_graph.py` — граф тензорных операций: значения и градиенты по шагам
 - `compile_blas.py` — **компиляция графа в C+BLAS**: forward и backward
   (`@`→`cblas_sgemm`, grad-matmul→sgemm с `CblasTrans`), fusion, профилировщик
