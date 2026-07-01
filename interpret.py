@@ -185,6 +185,57 @@ def attention_map_png(P, tok, layer=3, path="docs/images/attention.png"):
     print(f"=== 2b. PNG карты внимания сохранён: {path} ===")
 
 
+def find_induction_head(P, n=8, seed=0):
+    """Каноничный тест: случайная последовательность, повторённая дважды.
+    Индукц. балл головы = внимание позиции i (2-я половина) на (i-n)+1 —
+    токен, что СЛЕДОВАЛ за прошлым вхождением. Возвращает (слой, голова, балл, ids)."""
+    rng = np.random.default_rng(seed)
+    half = rng.integers(200, 4000, n).tolist()
+    ids = half + half
+    A = run_capture_attn(P, ids)
+    best = (-1.0, 0, 0)
+    for l, aw in enumerate(A):
+        for h in range(aw.shape[0]):
+            score = float(np.mean([aw[h, i, (i - n) + 1] for i in range(n, 2 * n - 1)]))
+            if score > best[0]:
+                best = (score, l, h)
+    return best[1], best[2], best[0], ids
+
+
+def induction_head_png(P, tok, n=8, path="docs/images/induction_head.png"):
+    """Карта найденной индукционной головы — видна диагональ сдвига во 2-й половине."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    layer, head, score, ids = find_induction_head(P, n=n)
+    aw = run_capture_attn(P, ids)[layer][head]           # (T,T) конкретной головы
+    T = len(ids)
+    masked = np.where(np.triu(np.ones_like(aw), 1) > 0, np.nan, aw)
+    labels = [f"t{i}" for i in range(n)] + [f"t{i}'" for i in range(n)]
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=120)
+    im = ax.imshow(masked, cmap="magma", vmin=0, vmax=1)
+    ax.set_xticks(range(T)); ax.set_xticklabels(labels, fontsize=7)
+    ax.set_yticks(range(T)); ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("на кого смотрит (ключи)")
+    ax.set_ylabel("кто смотрит (запросы)")
+    # обвести индукционную диагональ: запрос i' (2-я копия) -> ключ (i+1) 1-й копии
+    for i in range(n, 2 * n - 1):
+        ax.add_patch(plt.Rectangle(((i - n) + 1 - .5, i - .5), 1, 1,
+                     fill=False, edgecolor="cyan", lw=1.8))
+    ax.set_title(f"Индукционная голова: слой {layer}, голова {head}\n"
+                 f"induction score = {score:.2f} (случайно ~{1/T:.2f})\n"
+                 f"голубым — сдвиг +1: t_i' смотрит на того, кто шёл за t_i")
+    fig.colorbar(im, ax=ax, fraction=0.046, label="вес внимания")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"=== 2d. PNG индукционной головы (L{layer}H{head}) сохранён: {path} ===")
+
+
 def attention_layers_png(P, tok, text="The cat sat on the mat",
                          path="docs/images/attention_layers.png"):
     """Сетка тепловых карт внимания по ВСЕМ слоям — видно разделение труда."""
@@ -347,6 +398,7 @@ def main():
     attention_map(P, tok)
     attention_map_png(P, tok)
     attention_layers_png(P, tok)
+    induction_head_png(P, tok)
     logit_lens(P, tok)
     token_journey(P, tok)
     token_journey_png(P, tok)
