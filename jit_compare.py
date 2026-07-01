@@ -1,13 +1,12 @@
 """
 Наш C+BLAS vs PyTorch eager vs torch.compile — развёртка по размеру модели.
 
-Идея: JIT (torch.compile) окупается на МАСШТАБЕ. На мелкой модели он медленнее
-eager (накладные на guards/обёртку), на крупной — обгоняет (фьюжн, планирование
-памяти, меньше запусков ядер). Прогоняем один MLP-forward на растущих размерах.
+Идея: torch.compile выигрывает не «на масштабе», а где узкое место — ПАМЯТЬ
+(фьюжн поэлементных операций) или запуски ядер (GPU). На matmul-bound MLP он на
+CPU не быстрее eager (matmul и там, и там — BLAS). См. функцию elementwise().
 
-Наш compile_blas зашивает данные как C-литералы, поэтому масштабируется плохо
-(файл раздувается) — включаем его только на малом размере. Настоящие компиляторы
-передают данные указателями (как mnist_c.py через файл), а не литералами.
+Наш compile_blas читает данные из бинарного файла (не литералы), поэтому
+масштабируется на любые размеры — включён во все строки.
 
 Запуск:  python3 jit_compare.py
 """
@@ -62,13 +61,9 @@ def main():
         mc = torch.compile(m)
         comp = bench(lambda: mc(tx), reps)
 
-        # наш C — только пока данных не слишком много для литералов
-        leafs = B * K + K * H + H * O + H + O
-        if leafs < 300_000:
-            g = (Tensor(X) @ Tensor(W1) + Tensor(b1)).relu() @ Tensor(W2) + Tensor(b2)
-            our_c = f"{compile_blas.compile_and_time(g, reps):.3f} мс"
-        else:
-            our_c = "— (литералы)"
+        # наш C — теперь на любом размере (данные читаются из файла, не литералы)
+        g = (Tensor(X) @ Tensor(W1) + Tensor(b1)).relu() @ Tensor(W2) + Tensor(b2)
+        our_c = f"{compile_blas.compile_and_time(g, reps):.3f} мс"
 
         tag = f"{B}x{K}->{H}->{O}"
         print(f"{tag:22} {our_c:>12} {eager:9.3f} мс {comp:11.3f} мс "

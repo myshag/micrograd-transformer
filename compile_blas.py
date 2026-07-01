@@ -24,14 +24,6 @@ import tensor
 from tensor import Tensor
 
 
-def _cf(x):
-    """Число -> корректный C-литерал float (всегда с точкой/экспонентой)."""
-    s = f"{float(x):.9g}"
-    if not any(c in s for c in ".eEnf"):     # '0' -> '0.0', '2' -> '2.0'
-        s += ".0"
-    return s + "f"
-
-
 def topo_sort(root):
     topo, seen = [], set()
 
@@ -65,8 +57,23 @@ def _apply_ew(node, idx):
     raise ValueError(op)
 
 
-def generate_c(root, reps=None, profile=False, fuse=False):
+def _leaves(root):
+    """Листья графа (входы/веса) в топологическом порядке."""
+    return [n for n in topo_sort(root) if not n._inputs]
+
+
+def write_data(root, path):
+    """Записать данные листьев в бинарный файл (в том же порядке, что читает C)."""
+    with open(path, "wb") as f:
+        for n in _leaves(root):
+            f.write(np.ascontiguousarray(n.data, dtype=np.float32).tobytes())
+
+
+def generate_c(root, reps=None, profile=False, fuse=False, data_path="data.bin"):
     """Сгенерировать C-исходник forward-прохода графа.
+
+    Данные листьев НЕ вшиваются в код литералами, а читаются из бинарного файла
+    data_path (fread) — так компилятор масштабируется на любые размеры.
 
     reps=None            — вычислить один раз и напечатать выход (для сверки).
     reps=N               — прогнать N раз с таймером, напечатать среднее время.
@@ -96,12 +103,13 @@ def generate_c(root, reps=None, profile=False, fuse=False):
                 if is_ew(c) and c._inputs[0] is n:
                     internal.add(n)
 
-    decls, body, labels = [], [], []
+    decls, body, labels, load = [], [], [], []
     for n in topo:
         size = max(1, int(np.prod(n.data.shape)))
         if not n._inputs:                                   # входной лист
-            vals = ", ".join(_cf(x) for x in n.data.ravel(order="C"))
-            decls.append(f"static float t{idx[n]}[{size}] = {{ {vals} }};")
+            decls.append(f"static float t{idx[n]}[{size}];")
+            load.append(f"  if(fread(t{idx[n]},sizeof(float),{n.data.size},_f)"
+                        f"!={n.data.size}) return 1;")
             continue
         if n in internal:                                   # слит в потребителя
             continue
@@ -137,15 +145,18 @@ def generate_c(root, reps=None, profile=False, fuse=False):
     headers = ["#include <stdio.h>", "#include <math.h>", "#include <cblas.h>"]
     timer = ("static double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);"
              "return t.tv_sec+t.tv_nsec*1e-9;}")
+    # чтение данных листьев из файла — вставляется в начало main
+    load_block = ([f'  FILE* _f=fopen("{data_path}","rb"); if(!_f) return 2;']
+                  + load + ["  fclose(_f);"])
 
     if reps is None:
-        main = ["int main(void){",
+        main = ["int main(void){", *load_block,
                 *[f"  {line}" for line in body],
                 f"  for(int i=0;i<{root.data.size};i++) printf(\"%.7g \", t{idx[root]}[i]);",
                 "  printf(\"\\n\");  return 0;", "}"]
     elif not profile:
         headers.append("#include <time.h>")
-        main = [timer, "int main(void){",
+        main = [timer, "int main(void){", *load_block,
                 "  double _start=now();",
                 f"  for(int r=0;r<{reps};r++){{",
                 *[f"    {line}" for line in body],
@@ -169,7 +180,7 @@ def generate_c(root, reps=None, profile=False, fuse=False):
                 f'prof[{i}]/{reps}*1e3, 100.0*prof[{i}]/total);')
         prints.append(f'  printf("  %-24s %10.5f\\n", "ВСЕГО", total/{reps}*1e3);')
         prints.append(f'  printf("anchor %g\\n", t{idx[root]}[0]);')
-        main = [timer, "int main(void){",
+        main = [timer, "int main(void){", *load_block,
                 f"  double prof[{n_ops}]={{0}}, _s;",
                 *loop, *prints, "  return 0;", "}"]
 
@@ -229,21 +240,22 @@ def _bwd_stmts(n, idx):
     raise ValueError(op)
 
 
-def generate_backward_c(root, named):
+def generate_backward_c(root, named, data_path="data.bin"):
     """C-исходник: forward + backward графа, печать градиентов листьев `named`.
 
     named: dict {имя: Tensor-лист}. Выходной градиент засевается единицами
-    (как self.grad = ones в нашем backward).
+    (как self.grad = ones в нашем backward). Данные листьев читаются из файла.
     """
     topo = topo_sort(root)
     idx = {n: i for i, n in enumerate(topo)}
 
-    decls, fwd, bwd = [], [], []
+    decls, fwd, bwd, load = [], [], [], []
     for n in topo:
         size = max(1, int(np.prod(n.data.shape)))
         if not n._inputs:
-            vals = ", ".join(_cf(x) for x in n.data.ravel(order="C"))
-            decls.append(f"static float t{idx[n]}[{size}] = {{ {vals} }};")
+            decls.append(f"static float t{idx[n]}[{size}];")     # данные из файла
+            load.append(f"  if(fread(t{idx[n]},sizeof(float),{n.data.size},_f)"
+                        f"!={n.data.size}) return 1;")
         else:
             decls.append(f"static float t{idx[n]}[{size}];")
             fwd.append(_fwd_stmt(n, idx))
@@ -261,16 +273,19 @@ def generate_backward_c(root, named):
         prints.append(f'  for(int i=0;i<{node.data.size};i++) printf(" %.7g", g{idx[node]}[i]);')
         prints.append('  printf("\\n");')
 
+    load_block = ([f'  FILE* _f=fopen("{data_path}","rb"); if(!_f) return 2;']
+                  + load + ["  fclose(_f);"])
     return "\n".join(
         ["#include <stdio.h>", "#include <math.h>", "#include <cblas.h>"]
-        + decls + ["int main(void){"]
+        + decls + ["int main(void){"] + load_block
         + [f"  {s}" for s in fwd] + [f"  {s}" for s in bwd] + prints
         + ["  return 0;", "}", ""])
 
 
 def compile_backward(root, named):
     """Скомпилировать backward в C+BLAS, вернуть {имя: numpy-градиент}."""
-    src = generate_backward_c(root, named)
+    data = _data_file(root)
+    src = generate_backward_c(root, named, data_path=data)
     out = subprocess.run([_build(src)], capture_output=True, text=True, check=True).stdout
     grads = {}
     for line in out.strip().splitlines():
@@ -287,9 +302,17 @@ def _build(src):
     return epath
 
 
+def _data_file(root):
+    """Записать данные листьев во временный .bin и вернуть путь."""
+    path = tempfile.NamedTemporaryFile(suffix=".bin", delete=False).name
+    write_data(root, path)
+    return path
+
+
 def compile_and_run(root, fuse=False):
     """Скомпилировать граф в C (с BLAS), запустить, вернуть выход как numpy-массив."""
-    src = generate_c(root, fuse=fuse)
+    data = _data_file(root)
+    src = generate_c(root, fuse=fuse, data_path=data)
     out = subprocess.run([_build(src)], capture_output=True, text=True, check=True).stdout
     arr = np.array([float(x) for x in out.split()], dtype=np.float32)
     return arr.reshape(root.data.shape), src
@@ -297,14 +320,17 @@ def compile_and_run(root, fuse=False):
 
 def compile_and_time(root, reps, fuse=False):
     """Скомпилировать и замерить среднее время forward в C (мс/проход)."""
-    out = subprocess.run([_build(generate_c(root, reps, fuse=fuse))],
+    data = _data_file(root)
+    out = subprocess.run([_build(generate_c(root, reps, fuse=fuse, data_path=data))],
                          capture_output=True, text=True, check=True).stdout
     return float(out.split()[0])
 
 
 def compile_and_profile(root, reps, fuse=False):
     """Скомпилировать с таймером вокруг каждой операции; вернуть текст-разбивку."""
-    out = subprocess.run([_build(generate_c(root, reps, profile=True, fuse=fuse))],
+    data = _data_file(root)
+    out = subprocess.run([_build(generate_c(root, reps, profile=True, fuse=fuse,
+                                            data_path=data))],
                          capture_output=True, text=True, check=True).stdout
     return out
 
