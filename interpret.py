@@ -155,6 +155,43 @@ def logit_lens(P, tok):
     print("  (видно, как предсказание формируется от ранних слоёв к поздним)")
 
 
+# --- 4. Путь токена по слоям (logit lens во времени) ------------------------
+
+def token_journey(P, tok, prompt="The capital of France is", n_track=4):
+    ids = tok(prompt)["input_ids"]
+    # стадии: эмбеддинг (до слоёв) + состояние после каждого слоя, позиция -1
+    emb = P["gpt_neox.embed_in.weight"].data[ids[-1]]
+    stages = [("эмб", emb)] + [(f"сл{i}", h[-1]) for i, h in enumerate(run_capture(P, ids))]
+
+    lens = []
+    for name, h in stages:
+        lo = unembed(P, h)
+        e = np.exp(lo - lo.max())
+        lens.append((name, e / e.sum()))                 # вероятности (vocab,)
+
+    final = lens[-1][1]
+    tracked = final.argsort()[::-1][:n_track]             # топ-кандидаты финала
+    win = tracked[0]
+    wname = tok.decode([win]).strip()
+
+    print(f"\n=== 4. Путь токена {wname!r} к вершине по слоям (logit lens) ===")
+    print(f"промпт: {prompt!r}\n")
+    for name, probs in lens:
+        pr = probs[win]
+        rank = int((probs > pr).sum()) + 1
+        bar = "█" * int(round(pr / final[win] * 26))
+        print(f"  {name}  |{bar:<26}| p={pr:.3f}  ранг #{rank}")
+    print(f"  ↑ {wname!r} поднимается из глубин словаря к #1 сквозь слои\n")
+
+    # заодно — как соперничают несколько кандидатов (их ранг по слоям)
+    print("  Конкуренция кандидатов (ранг по слоям):")
+    print("        " + "  ".join(f"{n:>4}" for n, _ in lens))
+    for t in tracked:
+        ranks = [int((probs > probs[t]).sum()) + 1 for _, probs in lens]
+        print(f"  {tok.decode([t]).strip()[:6]:>6}  " +
+              "  ".join(f"{r:>4}" for r in ranks))
+
+
 def main():
     from transformers import AutoTokenizer
     print("Загружаю Pythia-70M...")
@@ -163,6 +200,7 @@ def main():
     emb_map(P, tok)
     attention_map(P, tok)
     logit_lens(P, tok)
+    token_journey(P, tok)
 
 
 if __name__ == "__main__":
