@@ -116,6 +116,11 @@ class no_grad:
         return False
 
 
+def _canon_device(d):
+    """Канонизировать имя устройства: 'cuda' == 'cuda:0' (как в PyTorch)."""
+    return "cuda:0" if d == "cuda" else d
+
+
 class Tensor:
     """Узел графа: массив numpy + его градиент той же формы."""
 
@@ -131,7 +136,7 @@ class Tensor:
         self._op = _op
         # Устройство: по умолчанию наследуем от первого входа (так device сам
         # распространяется по всему графу), для листа — 'cpu', либо задано явно.
-        self.device = device if device is not None else (
+        self.device = _canon_device(device) if device is not None else (
             _children[0].device if _children else "cpu")
 
     def _set_backward(self, fn):
@@ -149,6 +154,7 @@ class Tensor:
 
     def to(self, device):
         """Переместить тензор на устройство. Значения те же, меняется backend."""
+        device = _canon_device(device)
         if device == self.device:
             return self
         out = Tensor(self.data, (self,), f"to:{device}", device=device)
@@ -162,8 +168,8 @@ class Tensor:
     def cpu(self):
         return self.to("cpu")
 
-    def cuda(self):
-        return self.to("cuda")
+    def cuda(self, index=0):
+        return self.to(f"cuda:{index}")   # index -> мульти-GPU (cuda:0, cuda:1, ...)
 
     # --- Операции -----------------------------------------------------------
 

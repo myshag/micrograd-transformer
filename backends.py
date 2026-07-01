@@ -157,15 +157,98 @@ class CudaSimBackend(NumpyBackend):
         return _launch_unary("sigmoid", x)
 
 
+# --- Настоящий CUDA-бэкенд через .cu-ядра (нужен GPU + CuPy) -----------------
+# Демонстрирует главный смысл диспетчера: чтобы задействовать реальный GPU,
+# добавляется ОДИН класс — ни строчки в Tensor. Здесь не запускается (нет GPU),
+# но на машине с NVIDIA GPU это drop-in: use_real_cuda() подменяет бэкенд 'cuda'.
+_real_mod = None
+
+
+def _real_kernels():
+    global _real_mod
+    if _real_mod is None:
+        import cupy as cp                      # требует GPU + CUDA toolkit
+        src = open("kernels.cu").read()
+        _real_mod = cp.RawModule(code=src)     # NVRTC компилирует .cu -> PTX
+    return _real_mod
+
+
+class RealCudaBackend(NumpyBackend):
+    """'cuda' на НАСТОЯЩЕМ GPU: ядра из kernels.cu через CuPy (NVRTC).
+
+    Для наглядности на каждой операции копируем host<->device. В боевом варианте
+    данные жили бы на GPU (cupy-массивы) постоянно, без копий на каждый шаг.
+    """
+
+    def _ew(self, fname, *arrays):
+        import cupy as cp
+        import numpy as _np
+        mod = _real_kernels()
+        n = arrays[0].size
+        dev = [cp.asarray(a, dtype=cp.float32).reshape(-1) for a in arrays]
+        o = cp.empty(n, dtype=cp.float32)
+        tpb = 256
+        mod.get_function(fname)(((n + tpb - 1) // tpb,), (tpb,),
+                                (*dev, o, _np.int32(n)))
+        return cp.asnumpy(o).reshape(arrays[0].shape)
+
+    def matmul(self, a, b):
+        import cupy as cp
+        import numpy as _np
+        if a.ndim != 2 or b.ndim != 2:
+            return super().matmul(a, b)
+        mod = _real_kernels()
+        A = cp.asarray(a, dtype=cp.float32); B = cp.asarray(b, dtype=cp.float32)
+        M, K = A.shape; N = B.shape[1]
+        C = cp.zeros((M, N), dtype=cp.float32)
+        tpb = (8, 8)
+        bpg = ((N + 7) // 8, (M + 7) // 8)     # (x=cols, y=rows)
+        mod.get_function("matmul")(bpg, tpb,
+            (A, B, C, _np.int32(M), _np.int32(N), _np.int32(K)))
+        return cp.asnumpy(C)
+
+    def add(self, a, b):
+        return self._ew("ew_add", np.broadcast_to(a, np.broadcast_shapes(a.shape, b.shape)),
+                        np.broadcast_to(b, np.broadcast_shapes(a.shape, b.shape)))
+
+    def mul(self, a, b):
+        s = np.broadcast_shapes(a.shape, b.shape)
+        return self._ew("ew_mul", np.broadcast_to(a, s), np.broadcast_to(b, s))
+
+    def relu(self, x):
+        return self._ew("ew_relu", x)
+
+    def tanh(self, x):
+        return self._ew("ew_tanh", x)
+
+    def sigmoid(self, x):
+        return self._ew("ew_sigmoid", x)
+
+
 BACKENDS = {
     "cpu": NumpyBackend(),
-    "cuda": CudaSimBackend(),
+    "cuda": CudaSimBackend(),      # по умолчанию — симулятор (работает без GPU)
 }
 
 
+def use_real_cuda():
+    """Переключить 'cuda' на настоящие .cu-ядра (нужен GPU + CuPy).
+
+    Весь смысл диспетчера: одна строка — и весь код, использующий device='cuda',
+    начинает считать на реальном GPU. Ни Tensor, ни модели не меняются.
+    """
+    BACKENDS["cuda"] = RealCudaBackend()
+
+
 def get_backend(device):
-    """Диспетч: вернуть бэкенд для устройства."""
-    if device not in BACKENDS:
+    """Диспетч: вернуть бэкенд для устройства.
+
+    Бэкенд выбирается по БАЗОВОМУ типу: 'cuda:0' и 'cuda:1' используют один
+    бэкенд 'cuda' (у нас — симулятор). Различие устройств хранится в метке
+    Tensor.device и проверяется на совместимость операндов (мульти-GPU).
+    """
+    base = device.split(":")[0]               # 'cuda:1' -> 'cuda'
+    if base not in BACKENDS:
         raise ValueError(f"неизвестное устройство: {device!r} "
                          f"(есть: {list(BACKENDS)})")
-    return BACKENDS[device]
+    return BACKENDS[base]
