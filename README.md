@@ -19,6 +19,8 @@
 - `compile_blas.py` — **компиляция графа в C+BLAS**: forward и backward
   (`@`→`cblas_sgemm`, grad-matmul→sgemm с `CblasTrans`), fusion, профилировщик
 - `train_c.py` — **полный цикл обучения слоя в C**: forward+backward+SGD в BLAS
+- `mnist_c.py` — **MNIST-классификатор целиком в C+BLAS** (784→128→10, softmax),
+  **97% за ~4 c**
 - `download_mnist.py` — скачивает датасет в `data/mnist.npz`
 - `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох
 
