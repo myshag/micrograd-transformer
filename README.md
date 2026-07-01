@@ -14,7 +14,9 @@
 
 **Часть 2 — тензорный движок + MNIST (практика):**
 - `tensor.py` — тот же autograd, но узлы графа — матрицы numpy (класс `Tensor`);
-  считает в `float32` (×2 к скорости/памяти; `set_dtype(np.float64)` для сверки)
+  считает в `float32` (×2 к скорости/памяти; `set_dtype(np.float64)` для сверки);
+  параметр `device` (`.cuda()/.cpu()/.to()`) — cpu=numpy, cuda=CUDA-кернел в симуляторе
+- `device_demo.py` — параметр `device` в стиле PyTorch (диспетч бэкенда, cpu↔cuda)
 - `tensor_graph.py` — граф тензорных операций: значения и градиенты по шагам
 - `compile_blas.py` — **компиляция графа в C+BLAS**: forward и backward
   (`@`→`cblas_sgemm`, grad-matmul→sgemm с `CblasTrans`), fusion, профилировщик

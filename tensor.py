@@ -13,6 +13,8 @@
 форме, просуммировав по растянутым осям. За это отвечает _unbroadcast.
 """
 
+import os
+
 import numpy as np
 
 
@@ -114,10 +116,50 @@ class no_grad:
         return False
 
 
+# --- Диспетчер по устройству (device) ---------------------------------------
+# 'cpu' считает через numpy. 'cuda' демонстрационно исполняет ту же операцию
+# через CUDA-кернел в СИМУЛЯТОРЕ Numba (без настоящего GPU): видно, как device
+# выбирает бэкенд вычислений — как в PyTorch. Скорости GPU здесь нет.
+_cuda_cache = None
+_nbcuda = None      # модульная ссылка на numba.cuda: kernel резолвит имена в
+                    # симуляторе через globals функции, а не через замыкание.
+
+
+def _get_cuda():
+    global _cuda_cache, _nbcuda
+    if _cuda_cache is None:
+        os.environ.setdefault("NUMBA_ENABLE_CUDASIM", "1")   # ДО импорта cuda
+        from numba import cuda
+        _nbcuda = cuda
+
+        @cuda.jit
+        def _mm(C, A, B):                      # один поток на элемент C[i,j]
+            i, j = _nbcuda.grid(2)
+            if i < C.shape[0] and j < C.shape[1]:
+                acc = 0.0
+                for k in range(A.shape[1]):
+                    acc += A[i, k] * B[k, j]
+                C[i, j] = acc
+
+        _cuda_cache = (cuda, _mm)
+    return _cuda_cache
+
+
+def _cuda_matmul(A, B):
+    if A.ndim != 2 or B.ndim != 2:             # батчи — на хосте (упрощение)
+        return A @ B
+    cuda, mm = _get_cuda()
+    C = np.zeros((A.shape[0], B.shape[1]), dtype=A.dtype)
+    tpb = (8, 8)
+    bpg = (int(np.ceil(C.shape[0] / tpb[0])), int(np.ceil(C.shape[1] / tpb[1])))
+    mm[bpg, tpb](C, np.ascontiguousarray(A), np.ascontiguousarray(B))
+    return C
+
+
 class Tensor:
     """Узел графа: массив numpy + его градиент той же формы."""
 
-    def __init__(self, data, _children=(), _op=""):
+    def __init__(self, data, _children=(), _op="", device=None):
         self.data = np.asarray(data, dtype=_dtype)
         # Под no_grad не аллоцируем grad (экономия памяти) и не держим детей.
         self.grad = np.zeros_like(self.data) if _grad_enabled else None
@@ -127,6 +169,10 @@ class Tensor:
         # графа в C (compile_blas.py). Множество _prev это теряет.
         self._inputs = tuple(_children)
         self._op = _op
+        # Устройство: по умолчанию наследуем от первого входа (так device сам
+        # распространяется по всему графу), для листа — 'cpu', либо задано явно.
+        self.device = device if device is not None else (
+            _children[0].device if _children else "cpu")
 
     def _set_backward(self, fn):
         # Регистрируем backward только если граф включён. Иначе замыкание
@@ -138,6 +184,26 @@ class Tensor:
     @property
     def shape(self):
         return self.data.shape
+
+    # --- Устройство (как в PyTorch) -----------------------------------------
+
+    def to(self, device):
+        """Переместить тензор на устройство. Значения те же, меняется backend."""
+        if device == self.device:
+            return self
+        out = Tensor(self.data, (self,), f"to:{device}", device=device)
+
+        def _backward():           # перенос — тождественная операция
+            self.grad += out.grad
+
+        out._set_backward(_backward)
+        return out
+
+    def cpu(self):
+        return self.to("cpu")
+
+    def cuda(self):
+        return self.to("cuda")
 
     # --- Операции -----------------------------------------------------------
 
@@ -169,8 +235,14 @@ class Tensor:
 
         Поддерживает батчи (любые ведущие оси, как в numpy): нужно для
         multi-head attention, где тензоры имеют форму (B, heads, T, d).
+        device выбирает бэкенд: 'cpu' -> numpy/BLAS, 'cuda' -> CUDA-кернел
+        (в симуляторе). Операнды должны быть на одном устройстве, как в PyTorch.
         """
-        out = Tensor(self.data @ other.data, (self, other), "@")
+        assert self.device == other.device, (
+            f"тензоры на разных устройствах: {self.device} и {other.device}")
+        result = (_cuda_matmul(self.data, other.data)
+                  if self.device == "cuda" else self.data @ other.data)
+        out = Tensor(result, (self, other), "@")
 
         def _backward():
             # Для C = A @ B:  dA = dC @ Bᵀ,  dB = Aᵀ @ dC.
@@ -464,4 +536,5 @@ class Tensor:
         return self * other
 
     def __repr__(self):
-        return f"Tensor(shape={self.data.shape})"
+        dev = "" if self.device == "cpu" else f", device='{self.device}'"
+        return f"Tensor(shape={self.data.shape}{dev})"
