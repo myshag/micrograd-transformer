@@ -39,16 +39,18 @@ def topo_sort(root):
     return topo
 
 
-def generate_c(root, reps=None):
+def generate_c(root, reps=None, profile=False):
     """Сгенерировать C-исходник forward-прохода графа.
 
-    reps=None — вычислить один раз и напечатать выход (для сверки).
-    reps=N    — прогнать N раз с таймером и напечатать среднее время (замер).
+    reps=None            — вычислить один раз и напечатать выход (для сверки).
+    reps=N               — прогнать N раз с таймером, напечатать среднее время.
+    reps=N, profile=True — то же, но с таймером ВОКРУГ КАЖДОЙ операции ->
+                           поэлементная разбивка времени (профилирование).
     """
     topo = topo_sort(root)
     idx = {n: i for i, n in enumerate(topo)}
 
-    decls, body = [], []
+    decls, body, labels = [], [], []
     for n in topo:
         size = max(1, int(np.prod(n.data.shape)))
         if not n._inputs:                                   # входной лист
@@ -66,6 +68,7 @@ def generate_c(root, reps=None):
             body.append(
                 f"cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,"
                 f"{M},{N},{K},1.0f,t{a},{K},t{b},{N},0.0f,t{idx[n]},{N});")
+            labels.append(f"matmul {M}x{K}@{K}x{N}")
         elif op == "+":                                     # сложение (+ bias)
             b = idx[ins[1]]
             sz = n.data.size
@@ -73,39 +76,59 @@ def generate_c(root, reps=None):
                 cols = ins[1].data.shape[0]
                 body.append(f"for(int i=0;i<{sz};i++) "
                             f"t{idx[n]}[i]=t{a}[i]+t{b}[i%{cols}];")
+                labels.append(f"add-bias [{n.data.shape[0]}x{cols}]")
             else:
                 body.append(f"for(int i=0;i<{sz};i++) t{idx[n]}[i]=t{a}[i]+t{b}[i];")
+                labels.append(f"add [{sz}]")
         elif op == "relu":
             body.append(f"for(int i=0;i<{n.data.size};i++)"
                         f"{{float x=t{a}[i];t{idx[n]}[i]=x>0?x:0;}}")
+            labels.append(f"relu [{n.data.size}]")
         elif op == "tanh":
             body.append(f"for(int i=0;i<{n.data.size};i++) "
                         f"t{idx[n]}[i]=tanhf(t{a}[i]);")
+            labels.append(f"tanh [{n.data.size}]")
         else:
             raise ValueError(f"компилятор не умеет операцию {op!r}")
 
     headers = ["#include <stdio.h>", "#include <math.h>", "#include <cblas.h>"]
+    timer = ("static double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);"
+             "return t.tv_sec+t.tv_nsec*1e-9;}")
 
     if reps is None:
-        # режим сверки: посчитать один раз, напечатать выход
         main = ["int main(void){",
                 *[f"  {line}" for line in body],
                 f"  for(int i=0;i<{root.data.size};i++) printf(\"%.7g \", t{idx[root]}[i]);",
-                "  printf(\"\\n\");",
-                "  return 0;", "}"]
-    else:
-        # режим замера: прогнать reps раз с таймером
+                "  printf(\"\\n\");  return 0;", "}"]
+    elif not profile:
         headers.append("#include <time.h>")
-        main = ["static double now(){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);"
-                "return t.tv_sec+t.tv_nsec*1e-9;}",
-                "int main(void){",
+        main = [timer, "int main(void){",
                 "  double _start=now();",
                 f"  for(int r=0;r<{reps};r++){{",
                 *[f"    {line}" for line in body],
                 "  }",
                 f"  double ms=(now()-_start)/{reps}*1e3;",
-                f"  printf(\"%.4f %.7g\\n\", ms, t{idx[root]}[0]);",  # время + якорь, чтобы цикл не выкинули
+                f"  printf(\"%.4f %.7g\\n\", ms, t{idx[root]}[0]);",
                 "  return 0;", "}"]
+    else:
+        # режим профилирования: таймер вокруг каждой операции
+        headers.append("#include <time.h>")
+        n_ops = len(body)
+        loop = [f"  for(int r=0;r<{reps};r++){{"]
+        for i, stmt in enumerate(body):
+            loop.append(f"    _s=now(); {stmt} prof[{i}]+=now()-_s;")
+        loop.append("  }")
+        prints = ['  double total=0; for(int i=0;i<%d;i++) total+=prof[i];' % n_ops]
+        prints.append('  printf("  %-24s %10s  %6s\\n", "операция", "мс/проход", "доля");')
+        for i, lab in enumerate(labels):
+            prints.append(
+                f'  printf("  %-24s %10.5f  %5.1f%%\\n", "{lab}", '
+                f'prof[{i}]/{reps}*1e3, 100.0*prof[{i}]/total);')
+        prints.append(f'  printf("  %-24s %10.5f\\n", "ВСЕГО", total/{reps}*1e3);')
+        prints.append(f'  printf("anchor %g\\n", t{idx[root]}[0]);')
+        main = [timer, "int main(void){",
+                f"  double prof[{n_ops}]={{0}}, _s;",
+                *loop, *prints, "  return 0;", "}"]
 
     return "\n".join(headers + decls + main + [""])
 
@@ -131,6 +154,13 @@ def compile_and_time(root, reps):
     out = subprocess.run([_build(generate_c(root, reps))],
                          capture_output=True, text=True, check=True).stdout
     return float(out.split()[0])
+
+
+def compile_and_profile(root, reps):
+    """Скомпилировать с таймером вокруг каждой операции; вернуть текст-разбивку."""
+    out = subprocess.run([_build(generate_c(root, reps, profile=True))],
+                         capture_output=True, text=True, check=True).stdout
+    return out
 
 
 def demo():
@@ -188,6 +218,27 @@ def bench():
           f"выигрыш — от снятия Python-обвязки и fusion)")
 
 
+def profile():
+    """Профилирование скомпилированного C: сколько времени на какой операции."""
+    rng = np.random.default_rng(0)
+    # Трёхслойный MLP — чтобы в разбивке было несколько gemm и поэлементных op.
+    x = Tensor(rng.standard_normal((64, 256)))
+    layers = [(256, 512), (512, 512), (512, 128)]
+    ins = []
+    for i, (nin, nout) in enumerate(layers):
+        W = Tensor(rng.standard_normal((nin, nout)))
+        b = Tensor(rng.standard_normal(nout))
+        ins += [W, b]
+    W1, b1, W2, b2, W3, b3 = ins
+    Y = ((x @ W1 + b1).relu() @ W2 + b2).relu() @ W3 + b3
+
+    print("\n=== Профиль forward (MLP 256->512->512->128), таймер вокруг каждой op ===")
+    print(compile_and_profile(Y, reps=1000).strip())
+    print("\n(matmul-и почти всё время — они в BLAS; поэлементные add/relu дёшевы,\n"
+          " но именно их слияние (fusion) убирает лишние проходы по памяти)")
+
+
 if __name__ == "__main__":
     demo()
     bench()
+    profile()
