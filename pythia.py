@@ -1,137 +1,145 @@
 """
-Запуск настоящей LLM (EleutherAI Pythia-70M, GPT-NeoX) на нашем движке.
+Настоящая LLM (Pythia-70M, GPT-NeoX) на нашем движке — ДИФФЕРЕНЦИРУЕМАЯ.
 
-Веса скачиваем с HuggingFace (transformers используем только как десериализатор
-весов и токенизатор — это ввод-вывод). Сам forward считается на НАШЕМ Tensor:
-matmul, softmax, LayerNorm, GELU. RoPE, раскладка голов, маска — numpy (это
-перестановки данных, как и в настоящих фреймворках).
+Forward собран целиком из наших Tensor-операций (без numpy посреди), поэтому
+граф не рвётся и backward доходит до каждого веса. RoPE выражен через
+дифференцируемые slice (`__getitem__`) и `cat`; эмбеддинг — `index_rows`;
+разрез QKV — срезами; головы — `reshape`/`swapaxes`.
 
-Особенности GPT-NeoX: объединённый QKV, rotary-эмбеддинги (RoPE, частичные),
-параллельный residual (attn и mlp читают из одного x), GELU.
+Веса грузим с HuggingFace (transformers — только десериализатор). Сверяем и
+forward-логиты, и backward-ГРАДИЕНТЫ с torch.autograd HF, затем генерируем текст.
 
-Сверяем логиты с эталоном HF, затем генерируем текст.
-
-Требуется: transformers (pip). Запуск:  python3 pythia.py
+Требуется: transformers. Запуск:  python3 pythia.py
 """
 
 import numpy as np
 
-from tensor import Tensor, no_grad
+from tensor import Tensor, cat, no_grad
 
 MODEL = "EleutherAI/pythia-70m"
-C = dict(hid=512, nl=6, nh=8, hd=64, inter=2048, vocab=50304,
-         rot=16, base=10000, eps=1e-5)   # rot = head_dim * rotary_pct(0.25)
+C = dict(hid=512, nl=6, nh=8, hd=64, vocab=50304, rot=16, base=10000, eps=1e-5)
 
 
-def load_weights(name=MODEL):
+def load_params(name=MODEL):
     from transformers import AutoModelForCausalLM
     sd = AutoModelForCausalLM.from_pretrained(name).state_dict()
-    return {k: v.numpy().astype(np.float32) for k, v in sd.items()}
+    return {k: Tensor(v.numpy().astype(np.float32)) for k, v in sd.items()}
 
 
-# --- слои на нашем Tensor -----------------------------------------------------
+# --- слои (всё на Tensor) -----------------------------------------------------
 
-def layernorm(h, g, b, eps):
+def layernorm(h, g, b):
     mu = h.mean(axis=-1, keepdims=True)
     xc = h - mu
     var = (xc * xc).mean(axis=-1, keepdims=True)
-    return xc / (var + eps) ** 0.5 * Tensor(g) + Tensor(b)
+    return xc / (var + C["eps"]) ** 0.5 * g + b
 
 
 def linear(h, W, b=None):
-    out = h @ Tensor(np.ascontiguousarray(W.T))    # W: (out,in) -> h@Wᵀ
-    return out if b is None else out + Tensor(b)
+    out = h @ W.T                       # W: (out,in) -> h @ Wᵀ
+    return out if b is None else out + b
 
-
-# --- RoPE (numpy: это поворот данных) ----------------------------------------
 
 def rope_cache(T, rot, base):
-    inv = 1.0 / (base ** (np.arange(0, rot, 2) / rot))     # (rot/2,)
-    freqs = np.outer(np.arange(T), inv)                    # (T, rot/2)
-    emb = np.concatenate([freqs, freqs], axis=-1)          # (T, rot)
-    return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+    inv = 1.0 / (base ** (np.arange(0, rot, 2) / rot))
+    freqs = np.outer(np.arange(T), inv)
+    emb = np.concatenate([freqs, freqs], axis=-1)
+    cos, sin = np.cos(emb), np.sin(emb)                  # (T, rot)
+    return (Tensor(cos[:, None, :].astype(np.float32)),
+            Tensor(sin[:, None, :].astype(np.float32)))  # (T,1,rot) для broadcast
 
 
-def apply_rope(x, cos, sin, rot):        # x: (T, nh, hd)
-    xr, xp = x[..., :rot], x[..., rot:]
+def rope(x, cos, sin, rot):             # x: (T, nh, hd) — всё дифференцируемо
+    xr, xp = x[:, :, :rot], x[:, :, rot:]
     half = rot // 2
-    rh = np.concatenate([-xr[..., half:], xr[..., :half]], axis=-1)
-    return np.concatenate([xr * cos[:, None, :] + rh * sin[:, None, :], xp], axis=-1)
+    rh = cat([-xr[:, :, half:], xr[:, :, :half]], axis=2)   # rotate_half
+    return cat([xr * cos + rh * sin, xp], axis=2)
 
 
-# --- forward всей модели ------------------------------------------------------
+# --- forward всей модели (дифференцируемый) -----------------------------------
 
-def forward(W, ids):
+def forward(P, ids):
     c, T = C, len(ids)
-    with no_grad():
-        h = Tensor(W["gpt_neox.embed_in.weight"][ids])     # эмбеддинг (T, D)
-        cos, sin = rope_cache(T, c["rot"], c["base"])
-        mask = np.triu(np.full((T, T), -1e9, np.float32), 1)
+    h = P["gpt_neox.embed_in.weight"].index_rows(np.asarray(ids))     # (T, hid)
+    cos, sin = rope_cache(T, c["rot"], c["base"])
+    mask = Tensor(np.triu(np.full((T, T), -1e9, np.float32), 1))
 
-        for i in range(c["nl"]):
-            p = f"gpt_neox.layers.{i}."
-            ln1 = layernorm(h, W[p + "input_layernorm.weight"],
-                            W[p + "input_layernorm.bias"], c["eps"])
-            # объединённый QKV -> (T, nh, 3*hd) -> q,k,v
-            qkv = linear(ln1, W[p + "attention.query_key_value.weight"],
-                         W[p + "attention.query_key_value.bias"]).data
-            qkv = qkv.reshape(T, c["nh"], 3 * c["hd"])
-            q, k, v = qkv[..., :c["hd"]], qkv[..., c["hd"]:2 * c["hd"]], qkv[..., 2 * c["hd"]:]
-            q = apply_rope(q, cos, sin, c["rot"])
-            k = apply_rope(k, cos, sin, c["rot"])
-            # (T, nh, hd) -> (nh, T, hd); внимание батчево по головам
-            q, k, v = q.transpose(1, 0, 2), k.transpose(1, 0, 2), v.transpose(1, 0, 2)
-            scores = (Tensor(np.ascontiguousarray(q)) @ Tensor(np.ascontiguousarray(k.transpose(0, 2, 1)))) \
-                * (1.0 / np.sqrt(c["hd"]))
-            scores = scores + Tensor(mask)                 # causal
-            ctx = (scores.softmax(axis=-1) @ Tensor(np.ascontiguousarray(v))).data
-            ctx = ctx.transpose(1, 0, 2).reshape(T, c["hid"])
-            attn = linear(Tensor(ctx), W[p + "attention.dense.weight"],
-                          W[p + "attention.dense.bias"])
+    for i in range(c["nl"]):
+        p = f"gpt_neox.layers.{i}."
+        ln1 = layernorm(h, P[p + "input_layernorm.weight"], P[p + "input_layernorm.bias"])
+        qkv = linear(ln1, P[p + "attention.query_key_value.weight"],
+                     P[p + "attention.query_key_value.bias"]).reshape(T, c["nh"], 3 * c["hd"])
+        q, k, v = qkv[:, :, :c["hd"]], qkv[:, :, c["hd"]:2 * c["hd"]], qkv[:, :, 2 * c["hd"]:]
+        q, k = rope(q, cos, sin, c["rot"]), rope(k, cos, sin, c["rot"])
+        q, k, v = q.swapaxes(0, 1), k.swapaxes(0, 1), v.swapaxes(0, 1)   # (nh,T,hd)
+        scores = (q @ k.mT) * (1.0 / np.sqrt(c["hd"])) + mask            # (nh,T,T)
+        ctx = (scores.softmax(axis=-1) @ v).swapaxes(0, 1).reshape(T, c["hid"])
+        attn = linear(ctx, P[p + "attention.dense.weight"], P[p + "attention.dense.bias"])
 
-            ln2 = layernorm(h, W[p + "post_attention_layernorm.weight"],
-                            W[p + "post_attention_layernorm.bias"], c["eps"])
-            m = linear(ln2, W[p + "mlp.dense_h_to_4h.weight"],
-                       W[p + "mlp.dense_h_to_4h.bias"]).gelu()
-            m = linear(m, W[p + "mlp.dense_4h_to_h.weight"],
-                       W[p + "mlp.dense_4h_to_h.bias"])
-            h = h + attn + m                               # параллельный residual
+        ln2 = layernorm(h, P[p + "post_attention_layernorm.weight"],
+                        P[p + "post_attention_layernorm.bias"])
+        m = linear(ln2, P[p + "mlp.dense_h_to_4h.weight"], P[p + "mlp.dense_h_to_4h.bias"]).gelu()
+        m = linear(m, P[p + "mlp.dense_4h_to_h.weight"], P[p + "mlp.dense_4h_to_h.bias"])
+        h = h + attn + m                                                 # parallel residual
 
-        h = layernorm(h, W["gpt_neox.final_layer_norm.weight"],
-                      W["gpt_neox.final_layer_norm.bias"], c["eps"])
-        return linear(h, W["embed_out.weight"]).data       # логиты (T, vocab)
+    h = layernorm(h, P["gpt_neox.final_layer_norm.weight"], P["gpt_neox.final_layer_norm.bias"])
+    return linear(h, P["embed_out.weight"])                             # (T, vocab)
 
 
-def generate(W, tok, prompt, n=30):
+def generate(P, tok, prompt, n=30):
     ids = tok(prompt)["input_ids"]
-    for _ in range(n):
-        logits = forward(W, ids)
-        ids.append(int(logits[-1].argmax()))              # greedy
+    with no_grad():
+        for _ in range(n):
+            ids.append(int(forward(P, ids).data[-1].argmax()))
     return tok.decode(ids)
+
+
+def validate(tok):
+    """Сверка forward И backward с torch.autograd HF — в float64, чтобы убрать
+    float32-шум (иначе накопление через 6 слоёв даёт разницу до ~1 в логитах)."""
+    import torch
+    import tensor as _T
+    from transformers import AutoModelForCausalLM
+    _T.set_dtype(np.float64)
+    hf = AutoModelForCausalLM.from_pretrained(MODEL).double()
+    P = {k: Tensor(v.detach().numpy().astype(np.float64)) for k, v in hf.state_dict().items()}
+
+    ids = tok("The capital of France is")["input_ids"]
+    logits = forward(P, ids)                          # forward на нашем движке
+    for pt in P.values():
+        pt.grad = np.zeros_like(pt.data)
+    loss = logits[:-1].softmax_cross_entropy(np.asarray(ids[1:], np.int64))
+    loss.backward()                                  # backward на нашем движке
+
+    inp = torch.tensor([ids])
+    out = hf(input_ids=inp, labels=inp)
+    out.loss.backward()                              # эталон torch.autograd
+    hf_g = {n: pr.grad.numpy() for n, pr in hf.named_parameters()}
+
+    print("=== Сверка с HF (float64) ===")
+    print(f"forward логиты: max|наш - HF| = "
+          f"{np.abs(logits.data - hf(inp).logits[0].detach().numpy()).max():.1e}")
+    print(f"loss: наш = {float(loss.data):.5f}, HF = {out.loss.item():.5f}")
+    print("backward (градиент через RoPE / attention / GELU / LayerNorm):")
+    for k in ["gpt_neox.embed_in.weight",
+              "gpt_neox.layers.0.attention.query_key_value.weight",
+              "gpt_neox.layers.3.mlp.dense_h_to_4h.weight",
+              "embed_out.weight"]:
+        rel = np.abs(P[k].grad - hf_g[k]).max() / max(1e-12, np.abs(hf_g[k]).max())
+        print(f"  {'.'.join(k.split('.')[-2:]):30} отн.расхождение = {rel:.1e}")
+    _T.set_dtype(np.float32)
 
 
 def main():
     from transformers import AutoTokenizer
     print("Загружаю Pythia-70M...")
-    W = load_weights()
     tok = AutoTokenizer.from_pretrained(MODEL)
 
-    # --- сверка логитов с эталоном HF ---
-    prompt = "The capital of France is"
-    ids = tok(prompt)["input_ids"]
-    ours = forward(W, ids)
-    import torch
-    from transformers import AutoModelForCausalLM
-    ref = AutoModelForCausalLM.from_pretrained(MODEL)(
-        torch.tensor([ids])).logits[0].detach().numpy()
-    print(f"\n=== Сверка forward с PyTorch/HF ===")
-    print(f"max|наш - HF| = {np.abs(ours - ref).max():.2e}")
-    print(f"argmax next token: наш={ours[-1].argmax()}, HF={ref[-1].argmax()}, "
-          f"совпал={ours[-1].argmax() == ref[-1].argmax()}")
+    validate(tok)                                    # forward+backward == HF (float64)
 
-    # --- генерация НА НАШЕМ ДВИЖКЕ ---
+    P = load_params()                                # float32 — генерация быстрее
     print("\n=== Генерация на нашем движке ===")
-    print(generate(W, tok, prompt, n=30))
+    print(generate(P, tok, "The capital of France is", n=30))
 
 
 if __name__ == "__main__":
