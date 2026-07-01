@@ -185,6 +185,43 @@ def attention_map_png(P, tok, layer=3, path="docs/images/attention.png"):
     print(f"=== 2b. PNG карты внимания сохранён: {path} ===")
 
 
+def forward_logits(P, ids, ablate=None):
+    """Полный forward до логитов. ablate=(layer, head) или список таких пар —
+    зануляет вклад голов (их ctx перед выходной проекцией) = zero-ablation."""
+    c, T = pythia.C, len(ids)
+    if ablate is not None and len(ablate) and isinstance(ablate[0], int):
+        ablate = [ablate]                                # одиночную пару -> список
+    abl = set(map(tuple, ablate)) if ablate else set()
+    with no_grad():
+        h = P["gpt_neox.embed_in.weight"].index_rows(np.asarray(ids))
+        cos, sin = pythia.rope_cache(T, c["rot"], c["base"])
+        mask = Tensor(np.triu(np.full((T, T), -1e9, np.float32), 1))
+        for i in range(c["nl"]):
+            p = f"gpt_neox.layers.{i}."
+            ln1 = pythia.layernorm(h, P[p + "input_layernorm.weight"], P[p + "input_layernorm.bias"])
+            qkv = pythia.linear(ln1, P[p + "attention.query_key_value.weight"],
+                                P[p + "attention.query_key_value.bias"]).reshape(T, c["nh"], 3 * c["hd"])
+            q, k, v = qkv[:, :, :c["hd"]], qkv[:, :, c["hd"]:2 * c["hd"]], qkv[:, :, 2 * c["hd"]:]
+            q, k = pythia.rope(q, cos, sin, c["rot"]), pythia.rope(k, cos, sin, c["rot"])
+            q, k, v = q.swapaxes(0, 1), k.swapaxes(0, 1), v.swapaxes(0, 1)
+            aw = ((q @ k.mT) * (1.0 / np.sqrt(c["hd"])) + mask).softmax(axis=-1)
+            ctx = (aw @ v).swapaxes(0, 1)                # (T, nh, hd)
+            heads_here = [hh for (ll, hh) in abl if ll == i]
+            if heads_here:
+                keep = np.ones((1, c["nh"], 1), np.float32)
+                for hh in heads_here:
+                    keep[0, hh, 0] = 0.0                 # зануляем указанные головы
+                ctx = ctx * Tensor(keep)
+            ctx = ctx.reshape(T, c["hid"])
+            attn = pythia.linear(ctx, P[p + "attention.dense.weight"], P[p + "attention.dense.bias"])
+            ln2 = pythia.layernorm(h, P[p + "post_attention_layernorm.weight"], P[p + "post_attention_layernorm.bias"])
+            mm = pythia.linear(ln2, P[p + "mlp.dense_h_to_4h.weight"], P[p + "mlp.dense_h_to_4h.bias"]).gelu()
+            mm = pythia.linear(mm, P[p + "mlp.dense_4h_to_h.weight"], P[p + "mlp.dense_4h_to_h.bias"])
+            h = h + attn + mm
+        ln = pythia.layernorm(h, P["gpt_neox.final_layer_norm.weight"], P["gpt_neox.final_layer_norm.bias"])
+        return (ln @ P["embed_out.weight"].T).data      # (T, vocab)
+
+
 def find_induction_head(P, n=8, seed=0):
     """Каноничный тест: случайная последовательность, повторённая дважды.
     Индукц. балл головы = внимание позиции i (2-я половина) на (i-n)+1 —
@@ -234,6 +271,67 @@ def induction_head_png(P, tok, n=8, path="docs/images/induction_head.png"):
     fig.savefig(path)
     plt.close(fig)
     print(f"=== 2d. PNG индукционной головы (L{layer}H{head}) сохранён: {path} ===")
+
+
+def _induction_prob(P, ablate, n=8, seeds=8):
+    """Средняя P(правильного индукц. токена) во 2-й копии при данной абляции."""
+    def sm(x):
+        e = np.exp(x - x.max()); return e / e.sum()
+    ps = []
+    for seed in range(seeds):
+        rng = np.random.default_rng(seed)
+        half = rng.integers(200, 4000, n).tolist()
+        full = half + half
+        L = forward_logits(P, full, ablate=ablate)
+        for i in range(n, 2 * n - 1):
+            ps.append(sm(L[i])[full[i + 1]])
+    return float(np.mean(ps))
+
+
+def ablation_png(P, tok, n=8, path="docs/images/ablation.png"):
+    """Причинный тест: зануляем индукционные головы и меряем просадку предсказания."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from collections import defaultdict
+
+    agg = defaultdict(list)                               # ранжируем головы по индукц. баллу
+    for seed in range(8):
+        rng = np.random.default_rng(seed)
+        half = rng.integers(200, 4000, n).tolist(); full = half + half
+        A = run_capture_attn(P, full)
+        for l, aw in enumerate(A):
+            for h in range(aw.shape[0]):
+                agg[(l, h)].append(np.mean([aw[h, i, (i - n) + 1] for i in range(n, 2 * n - 1)]))
+    rank = sorted(agg, key=lambda k: -np.mean(agg[k]))
+
+    base = _induction_prob(P, None, n)
+    d1 = _induction_prob(P, rank[:1], n)
+    d2 = _induction_prob(P, rank[:2], n)
+    d3 = _induction_prob(P, rank[:3], n)
+    allh = [(l, h) for l in range(6) for h in range(8)]
+    rc = np.random.default_rng(123)
+    ctrl = np.mean([_induction_prob(P, [allh[j] for j in rc.choice(len(allh), 3, replace=False)], n)
+                    for _ in range(6)])
+
+    labels = ["база", "-L3H5", "-топ2", "-топ3", "3 случ.\n(контроль)"]
+    vals = [base, d1, d2, d3, ctrl]
+    colors = ["#4059ad", "#e4572e", "#e4572e", "#e4572e", "#17a398"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5.5), dpi=120)
+    bars = ax.bar(labels, vals, color=colors)
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2, v + 0.003, f"{v:.3f}", ha="center", fontsize=9)
+    ax.axhline(base, ls="--", c="gray", alpha=0.6)
+    ax.set_ylabel("P(правильный индукц. токен)")
+    ax.set_title("Абляция индукционных голов: причинный тест\n"
+                 "зануление L3H5 и соседей рушит индукцию; случайные головы — нет")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"=== 2e. PNG абляции сохранён: {path}  "
+          f"(база {base:.3f} -> -L3H5 {d1:.3f} -> -топ3 {d3:.3f}; контроль {ctrl:.3f}) ===")
 
 
 def attention_layers_png(P, tok, text="The cat sat on the mat",
@@ -399,6 +497,7 @@ def main():
     attention_map_png(P, tok)
     attention_layers_png(P, tok)
     induction_head_png(P, tok)
+    ablation_png(P, tok)
     logit_lens(P, tok)
     token_journey(P, tok)
     token_journey_png(P, tok)
