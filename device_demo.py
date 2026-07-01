@@ -36,11 +36,20 @@ y = xc @ W                        # matmul -> CUDA-кернел, поток на
 print("   результат:", y, "| device распространился сам:", y.device)
 print("   сверка с cpu: max diff =", np.abs(y.data - (x.cpu() @ W.cpu()).data).max())
 
-line("4. device течёт через весь граф (мини-MLP forward на 'cuda')")
-W1 = Tensor(rng.standard_normal((8, 16)).astype(np.float32)).cuda()
-b1 = Tensor(rng.standard_normal(16).astype(np.float32)).cuda()
-h = (xc @ W1 + b1).relu()
-print("   после '@ + relu':", h, "| device =", h.device)
+line("4. ВЕСЬ forward мини-MLP идёт через CUDA-кернелы (@, +, relu — все на cuda)")
+W1 = Tensor(rng.standard_normal((8, 16)).astype(np.float32))
+b1 = Tensor(rng.standard_normal(16).astype(np.float32))
+W2 = Tensor(rng.standard_normal((16, 4)).astype(np.float32))
+b2 = Tensor(rng.standard_normal(4).astype(np.float32))
+
+def mlp(x, w1, bb1, w2, bb2):
+    return (x @ w1 + bb1).relu() @ w2 + bb2
+
+y_cpu = mlp(x, W1, b1, W2, b2)
+y_cuda = mlp(xc, W1.cuda(), b1.cuda(), W2.cuda(), b2.cuda())
+print("   выход на cuda:", y_cuda, "| device =", y_cuda.device)
+print("   сверка с cpu: max diff =", np.abs(y_cuda.data - y_cpu.data).max())
+print("   (matmul -> кернел поток-на-элемент; +bias и relu -> 1D-кернелы)")
 
 line("5. Разные устройства -> ошибка (как в torch)")
 try:

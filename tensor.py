@@ -13,6 +13,7 @@
 форме, просуммировав по растянутым осям. За это отвечает _unbroadcast.
 """
 
+import math
 import os
 
 import numpy as np
@@ -126,6 +127,7 @@ _nbcuda = None      # модульная ссылка на numba.cuda: kernel р
 
 
 def _get_cuda():
+    """Лениво собрать набор CUDA-кернелов (в симуляторе). Возвращает (cuda, dict)."""
     global _cuda_cache, _nbcuda
     if _cuda_cache is None:
         os.environ.setdefault("NUMBA_ENABLE_CUDASIM", "1")   # ДО импорта cuda
@@ -133,7 +135,7 @@ def _get_cuda():
         _nbcuda = cuda
 
         @cuda.jit
-        def _mm(C, A, B):                      # один поток на элемент C[i,j]
+        def _mm(C, A, B):                      # matmul: один поток на элемент C[i,j]
             i, j = _nbcuda.grid(2)
             if i < C.shape[0] and j < C.shape[1]:
                 acc = 0.0
@@ -141,19 +143,77 @@ def _get_cuda():
                     acc += A[i, k] * B[k, j]
                 C[i, j] = acc
 
-        _cuda_cache = (cuda, _mm)
+        # Поэлементные кернелы: 1D-сетка, поток на элемент (данные уже плоские).
+        @cuda.jit
+        def _add(o, a, b):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = a[i] + b[i]
+
+        @cuda.jit
+        def _mul(o, a, b):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = a[i] * b[i]
+
+        @cuda.jit
+        def _relu(o, x):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                v = x[i]
+                o[i] = v if v > 0.0 else 0.0
+
+        @cuda.jit
+        def _tanh(o, x):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = math.tanh(x[i])
+
+        @cuda.jit
+        def _sigmoid(o, x):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = 1.0 / (1.0 + math.exp(-x[i]))
+
+        _cuda_cache = (cuda, dict(mm=_mm, add=_add, mul=_mul,
+                                  relu=_relu, tanh=_tanh, sigmoid=_sigmoid))
     return _cuda_cache
 
 
 def _cuda_matmul(A, B):
     if A.ndim != 2 or B.ndim != 2:             # батчи — на хосте (упрощение)
         return A @ B
-    cuda, mm = _get_cuda()
+    _, k = _get_cuda()
     C = np.zeros((A.shape[0], B.shape[1]), dtype=A.dtype)
     tpb = (8, 8)
     bpg = (int(np.ceil(C.shape[0] / tpb[0])), int(np.ceil(C.shape[1] / tpb[1])))
-    mm[bpg, tpb](C, np.ascontiguousarray(A), np.ascontiguousarray(B))
+    k["mm"][bpg, tpb](C, np.ascontiguousarray(A), np.ascontiguousarray(B))
     return C
+
+
+def _cuda_unary(name, x):
+    _, k = _get_cuda()
+    # np.array(copy=True) -> записываемый плоский массив (симулятор Numba
+    # копирует аргументы обратно на хост, read-only view его роняет).
+    xf = np.array(x, dtype=x.dtype).reshape(-1)
+    o = np.empty_like(xf)
+    n = o.size
+    tpb = 64
+    k[name][(n + tpb - 1) // tpb, tpb](o, xf)
+    return o.reshape(x.shape)
+
+
+def _cuda_binary(name, a, b):
+    # broadcasting делаем на хосте, кернел работает над плоскими массивами
+    shape = np.broadcast_shapes(a.shape, b.shape)
+    af = np.array(np.broadcast_to(a, shape), dtype=a.dtype).reshape(-1)
+    bf = np.array(np.broadcast_to(b, shape), dtype=a.dtype).reshape(-1)
+    _, k = _get_cuda()
+    o = np.empty_like(af)
+    n = o.size
+    tpb = 64
+    k[name][(n + tpb - 1) // tpb, tpb](o, af, bf)
+    return o.reshape(shape)
 
 
 class Tensor:
@@ -208,8 +268,12 @@ class Tensor:
     # --- Операции -----------------------------------------------------------
 
     def __add__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other)
-        out = Tensor(self.data + other.data, (self, other), "+")
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        assert self.device == other.device, (
+            f"тензоры на разных устройствах: {self.device} и {other.device}")
+        result = (_cuda_binary("add", self.data, other.data)
+                  if self.device == "cuda" else self.data + other.data)
+        out = Tensor(result, (self, other), "+")
 
         def _backward():
             # Градиент сложения проходит как есть, но с поправкой на broadcasting.
@@ -220,8 +284,12 @@ class Tensor:
         return out
 
     def __mul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other)
-        out = Tensor(self.data * other.data, (self, other), "*")
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        assert self.device == other.device, (
+            f"тензоры на разных устройствах: {self.device} и {other.device}")
+        result = (_cuda_binary("mul", self.data, other.data)
+                  if self.device == "cuda" else self.data * other.data)
+        out = Tensor(result, (self, other), "*")
 
         def _backward():
             self.grad += _unbroadcast(other.data * out.grad, self.data.shape)
@@ -260,7 +328,9 @@ class Tensor:
         return self.matmul(other)
 
     def relu(self):
-        out = Tensor(np.maximum(0, self.data), (self,), "relu")
+        data = (_cuda_unary("relu", self.data)
+                if self.device == "cuda" else np.maximum(0, self.data))
+        out = Tensor(data, (self,), "relu")
 
         def _backward():
             # производная: 1 там, где вход был > 0, иначе 0
@@ -270,7 +340,8 @@ class Tensor:
         return out
 
     def tanh(self):
-        t = np.tanh(self.data)
+        t = (_cuda_unary("tanh", self.data)
+             if self.device == "cuda" else np.tanh(self.data))
         out = Tensor(t, (self,), "tanh")
 
         def _backward():
@@ -280,7 +351,8 @@ class Tensor:
         return out
 
     def sigmoid(self):
-        s = 1 / (1 + np.exp(-self.data))
+        s = (_cuda_unary("sigmoid", self.data)
+             if self.device == "cuda" else 1 / (1 + np.exp(-self.data)))
         out = Tensor(s, (self,), "sigmoid")
 
         def _backward():
