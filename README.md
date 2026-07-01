@@ -20,6 +20,8 @@
   (cuda-симулятор), `RealCudaBackend` (настоящий GPU через `.cu`); `get_backend(device)`
 - `kernels.cu` — настоящие CUDA C ядра (для `RealCudaBackend`; нужен GPU+CuPy)
 - `device_demo.py` — параметр `device` в стиле PyTorch (диспетч бэкенда, cpu↔cuda)
+- `pythia.py` — **настоящая LLM (Pythia-70M, GPT-NeoX) на нашем движке**: RoPE,
+  объединённый QKV, parallel residual, GELU; сверка с HF, генерация текста
 - `torch_compare.py` — **сверка с PyTorch** (оракул): точность (градиенты `~1e-8`)
   и скорость (PyTorch ~2.8× быстрее на CPU)
 - `jit_compare.py` — наш C+BLAS vs PyTorch eager vs `torch.compile` (native-код

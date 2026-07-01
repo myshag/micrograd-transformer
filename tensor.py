@@ -263,6 +263,26 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
+    def gelu(self):
+        # Точный GELU: 0.5*x*(1+erf(x/√2)). Нужен реальным LLM (GPT-2/NeoX).
+        x = self.data
+        # erf через приближение Абрамовица–Стегуна (ошибка ~1.5e-7)
+        z = np.abs(x / np.sqrt(2.0))
+        t = 1.0 / (1.0 + 0.3275911 * z)
+        erf = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                      - 0.284496736) * t + 0.254829592) * t * np.exp(-z * z)
+        erf = np.sign(x) * erf
+        cdf = 0.5 * (1.0 + erf)
+        out = Tensor(x * cdf, (self,), "gelu")
+
+        def _backward():
+            # d/dx gelu = cdf + x * pdf,  pdf = exp(-x^2/2)/√(2π)
+            pdf = np.exp(-x * x / 2.0) / np.sqrt(2.0 * np.pi)
+            self.grad += (cdf + x * pdf) * out.grad
+
+        out._set_backward(_backward)
+        return out
+
     def transpose(self):
         """Транспонирование. Нужно линейному слою (веса хранятся как (out, in))."""
         out = Tensor(self.data.T, (self,), "T")
