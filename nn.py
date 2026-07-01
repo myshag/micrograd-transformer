@@ -254,6 +254,8 @@ class MultiheadAttention(Module):
             mask = np.triu(np.full((T, T), -1e9), k=1)
             scores = scores + Tensor(mask)
         weights = scores.softmax(axis=-1)
+        # Сохраняем веса внимания последнего прохода (для визуализации/анализа).
+        self.attn_weights = weights.data                     # (B, h, T, T)
         context = weights @ V                                # (B, h, T, d_head)
 
         # Склеиваем головы обратно: (B, h, T, d_head) -> (B, T, d_model)
