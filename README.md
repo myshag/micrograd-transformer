@@ -13,7 +13,8 @@
 - `compile_graph.py` — **компиляция графа в C**: forward+backward → gcc → сверка
 
 **Часть 2 — тензорный движок + MNIST (практика):**
-- `tensor.py` — тот же autograd, но узлы графа — матрицы numpy (класс `Tensor`)
+- `tensor.py` — тот же autograd, но узлы графа — матрицы numpy (класс `Tensor`);
+  считает в `float32` (×2 к скорости/памяти; `set_dtype(np.float64)` для сверки)
 - `tensor_graph.py` — граф тензорных операций: значения и градиенты по шагам
 - `download_mnist.py` — скачивает датасет в `data/mnist.npz`
 - `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох

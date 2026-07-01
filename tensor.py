@@ -47,7 +47,7 @@ def im2col(x, kh, kw, stride, pad):
     out_w = (W + 2 * pad - kw) // stride + 1
     xp = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
 
-    cols = np.zeros((N, C, kh, kw, out_h, out_w))
+    cols = np.zeros((N, C, kh, kw, out_h, out_w), dtype=x.dtype)
     for i in range(kh):
         i_max = i + stride * out_h
         for j in range(kw):
@@ -62,7 +62,7 @@ def col2im(cols, x_shape, kh, kw, stride, pad, out_h, out_w):
     """Обратная к im2col: (N*out_h*out_w, C*kh*kw) -> (N, C, H, W)."""
     N, C, H, W = x_shape
     cols = cols.reshape(N, out_h, out_w, C, kh, kw).transpose(0, 3, 4, 5, 1, 2)
-    xp = np.zeros((N, C, H + 2 * pad, W + 2 * pad))
+    xp = np.zeros((N, C, H + 2 * pad, W + 2 * pad), dtype=cols.dtype)
     for i in range(kh):
         i_max = i + stride * out_h
         for j in range(kw):
@@ -76,6 +76,17 @@ def col2im(cols, x_shape, kh, kw, stride, pad, out_h, out_w):
 # операции не запоминают родителей и не заводят backward — так инференс не
 # держит в памяти весь граф и промежуточные карты сразу освобождаются.
 _grad_enabled = True
+
+# Тип чисел движка. float32 вдвое быстрее и легче по памяти, чем float64
+# (это же дефолт в PyTorch). Для строгой численной проверки градиентов можно
+# временно переключить на float64: tensor.set_dtype(np.float64).
+_dtype = np.float32
+
+
+def set_dtype(dt):
+    global _dtype
+    _dtype = dt
+
 
 # Используются в backward() для разрыва ссылочных циклов и освобождения графа.
 def _noop():
@@ -107,7 +118,7 @@ class Tensor:
     """Узел графа: массив numpy + его градиент той же формы."""
 
     def __init__(self, data, _children=(), _op=""):
-        self.data = np.asarray(data, dtype=np.float64)
+        self.data = np.asarray(data, dtype=_dtype)
         # Под no_grad не аллоцируем grad (экономия памяти) и не держим детей.
         self.grad = np.zeros_like(self.data) if _grad_enabled else None
         self._backward = lambda: None
