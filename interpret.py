@@ -152,6 +152,39 @@ def attention_map(P, tok, layer=3):
     print("   (нижний треугольник — каузальность: позиция видит только левое)")
 
 
+def attention_map_png(P, tok, layer=3, path="docs/images/attention.png"):
+    """Тепловая карта внимания: настоящий heatmap слоя (среднее по головам)."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    text = "The cat sat on the mat"
+    ids = tok(text)["input_ids"]
+    toks = [tok.decode([i]).strip() or "·" for i in ids]
+    aw = run_capture_attn(P, ids)[layer].mean(0)         # (T, T)
+    masked = np.where(np.triu(np.ones_like(aw), 1) > 0, np.nan, aw)  # скрыть будущее
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=120)
+    im = ax.imshow(masked, cmap="viridis", vmin=0, vmax=1)
+    ax.set_xticks(range(len(toks))); ax.set_xticklabels(toks)
+    ax.set_yticks(range(len(toks))); ax.set_yticklabels(toks)
+    ax.set_xlabel("на кого смотрит (ключи)")
+    ax.set_ylabel("кто смотрит (запросы)")
+    ax.set_title(f"Внимание Pythia-70M, слой {layer} (среднее по головам)\n"
+                 f"виден attention sink на первом токене")
+    for i in range(len(toks)):
+        for j in range(i + 1):
+            ax.text(j, i, f"{aw[i, j]:.2f}", ha="center", va="center",
+                    color="white" if aw[i, j] < 0.6 else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, fraction=0.046, label="вес внимания")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"=== 2b. PNG карты внимания сохранён: {path} ===")
+
+
 def run_capture_attn(P, ids):
     c, T = pythia.C, len(ids)
     attns = []
@@ -195,20 +228,25 @@ def logit_lens(P, tok):
 
 # --- 4. Путь токена по слоям (logit lens во времени) ------------------------
 
-def token_journey(P, tok, prompt="The capital of France is", n_track=4):
+def _journey_lens(P, tok, prompt, n_track):
+    """Стадии эмбеддинг+слои → (имена, вероятности logit lens, топ-кандидаты)."""
     ids = tok(prompt)["input_ids"]
-    # стадии: эмбеддинг (до слоёв) + состояние после каждого слоя, позиция -1
     emb = P["gpt_neox.embed_in.weight"].data[ids[-1]]
     stages = [("эмб", emb)] + [(f"сл{i}", h[-1]) for i, h in enumerate(run_capture(P, ids))]
-
-    lens = []
+    names, probs = [], []
     for name, h in stages:
         lo = unembed(P, h)
         e = np.exp(lo - lo.max())
-        lens.append((name, e / e.sum()))                 # вероятности (vocab,)
+        names.append(name)
+        probs.append(e / e.sum())
+    tracked = probs[-1].argsort()[::-1][:n_track]
+    return names, probs, tracked
 
+
+def token_journey(P, tok, prompt="The capital of France is", n_track=4):
+    names, probs_all, tracked = _journey_lens(P, tok, prompt, n_track)
+    lens = list(zip(names, probs_all))
     final = lens[-1][1]
-    tracked = final.argsort()[::-1][:n_track]             # топ-кандидаты финала
     win = tracked[0]
     wname = tok.decode([win]).strip()
 
@@ -230,6 +268,44 @@ def token_journey(P, tok, prompt="The capital of France is", n_track=4):
               "  ".join(f"{r:>4}" for r in ranks))
 
 
+def token_journey_png(P, tok, prompt="The capital of France is", n_track=4,
+                      path="docs/images/token_journey.png"):
+    """Две панели: ранг кандидатов по слоям (лог-шкала) и вероятность победителя."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names, probs_all, tracked = _journey_lens(P, tok, prompt, n_track)
+    x = range(len(names))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), dpi=120)
+
+    for t in tracked:
+        ranks = [int((p > p[t]).sum()) + 1 for p in probs_all]
+        ax1.plot(x, ranks, marker="o", label=tok.decode([t]).strip())
+    ax1.set_yscale("log"); ax1.invert_yaxis()            # #1 сверху
+    ax1.set_xticks(list(x)); ax1.set_xticklabels(names)
+    ax1.set_ylabel("ранг (лог-шкала, #1 сверху)")
+    ax1.set_title("Конкуренция кандидатов по слоям")
+    ax1.grid(True, alpha=0.3); ax1.legend()
+
+    win = tracked[0]
+    pwin = [p[win] for p in probs_all]
+    ax2.plot(x, pwin, marker="o", color="#e4572e")
+    ax2.fill_between(x, pwin, alpha=0.2, color="#e4572e")
+    ax2.set_xticks(list(x)); ax2.set_xticklabels(names)
+    ax2.set_ylabel("вероятность")
+    ax2.set_title(f"Как всплывает победитель {tok.decode([win]).strip()!r}")
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Путь токена сквозь слои (logit lens): {prompt!r}")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"=== 4b. PNG пути токена сохранён: {path} ===")
+
+
 def main():
     from transformers import AutoTokenizer
     print("Загружаю Pythia-70M...")
@@ -238,8 +314,10 @@ def main():
     emb_map(P, tok)
     emb_map_png(P, tok)
     attention_map(P, tok)
+    attention_map_png(P, tok)
     logit_lens(P, tok)
     token_journey(P, tok)
+    token_journey_png(P, tok)
 
 
 if __name__ == "__main__":
