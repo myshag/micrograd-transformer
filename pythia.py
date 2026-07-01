@@ -58,7 +58,8 @@ def rope(x, cos, sin, rot):             # x: (T, nh, hd) — всё диффер
 
 # --- forward всей модели (дифференцируемый) -----------------------------------
 
-def forward(P, ids):
+def hidden(P, ids):
+    """Forward тела до финального LayerNorm (без lm_head) — вход для головы."""
     c, T = C, len(ids)
     h = P["gpt_neox.embed_in.weight"].index_rows(np.asarray(ids))     # (T, hid)
     cos, sin = rope_cache(T, c["rot"], c["base"])
@@ -82,8 +83,12 @@ def forward(P, ids):
         m = linear(m, P[p + "mlp.dense_4h_to_h.weight"], P[p + "mlp.dense_4h_to_h.bias"])
         h = h + attn + m                                                 # parallel residual
 
-    h = layernorm(h, P["gpt_neox.final_layer_norm.weight"], P["gpt_neox.final_layer_norm.bias"])
-    return linear(h, P["embed_out.weight"])                             # (T, vocab)
+    return layernorm(h, P["gpt_neox.final_layer_norm.weight"],
+                     P["gpt_neox.final_layer_norm.bias"])
+
+
+def forward(P, ids):
+    return linear(hidden(P, ids), P["embed_out.weight"])                # (T, vocab)
 
 
 def generate(P, tok, prompt, n=30):
