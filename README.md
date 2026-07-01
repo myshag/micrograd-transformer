@@ -20,6 +20,8 @@
   (cuda-симулятор), `RealCudaBackend` (настоящий GPU через `.cu`); `get_backend(device)`
 - `kernels.cu` — настоящие CUDA C ядра (для `RealCudaBackend`; нужен GPU+CuPy)
 - `device_demo.py` — параметр `device` в стиле PyTorch (диспетч бэкенда, cpu↔cuda)
+- `torch_compare.py` — **сверка с PyTorch** (оракул): точность (градиенты `~1e-8`)
+  и скорость (PyTorch ~2.8× быстрее на CPU)
 - `multi_gpu_demo.py` — **мульти-GPU**: `cuda:0`/`cuda:1`, перенос `.to()`, model parallelism
 - `parallel.py` — **современный мульти-GPU параллелизм**: ring all-reduce (NCCL),
   data parallel (DDP), tensor parallel (Megatron), pipeline (GPipe),
