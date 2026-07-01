@@ -185,6 +185,37 @@ def attention_map_png(P, tok, layer=3, path="docs/images/attention.png"):
     print(f"=== 2b. PNG карты внимания сохранён: {path} ===")
 
 
+def attention_layers_png(P, tok, text="The cat sat on the mat",
+                         path="docs/images/attention_layers.png"):
+    """Сетка тепловых карт внимания по ВСЕМ слоям — видно разделение труда."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ids = tok(text)["input_ids"]
+    toks = [tok.decode([i]).strip() or "·" for i in ids]
+    A = run_capture_attn(P, ids)                          # list[nl] (nh,T,T)
+    nl = len(A)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=120)
+    for i, ax in enumerate(axes.flat):
+        m = A[i].mean(0)
+        masked = np.where(np.triu(np.ones_like(m), 1) > 0, np.nan, m)
+        im = ax.imshow(masked, cmap="viridis", vmin=0, vmax=1)
+        sink = m[1:, 0].mean()
+        ax.set_title(f"слой {i}  (sink→0: {sink:.2f})", fontsize=10)
+        ax.set_xticks(range(len(toks))); ax.set_xticklabels(toks, fontsize=7, rotation=45)
+        ax.set_yticks(range(len(toks))); ax.set_yticklabels(toks, fontsize=7)
+    fig.suptitle(f"Внимание Pythia-70M по слоям (среднее по головам): {text!r}\n"
+                 f"ранние слои — локальное смешивание, средние — attention sink, "
+                 f"поздний — сбор к предсказанию")
+    fig.colorbar(im, ax=axes, fraction=0.02, label="вес внимания")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"=== 2c. PNG внимания по слоям сохранён: {path} ===")
+
+
 def run_capture_attn(P, ids):
     c, T = pythia.C, len(ids)
     attns = []
@@ -315,6 +346,7 @@ def main():
     emb_map_png(P, tok)
     attention_map(P, tok)
     attention_map_png(P, tok)
+    attention_layers_png(P, tok)
     logit_lens(P, tok)
     token_journey(P, tok)
     token_journey_png(P, tok)
