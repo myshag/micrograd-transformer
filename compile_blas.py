@@ -24,6 +24,14 @@ import tensor
 from tensor import Tensor
 
 
+def _cf(x):
+    """Число -> корректный C-литерал float (всегда с точкой/экспонентой)."""
+    s = f"{float(x):.9g}"
+    if not any(c in s for c in ".eEnf"):     # '0' -> '0.0', '2' -> '2.0'
+        s += ".0"
+    return s + "f"
+
+
 def topo_sort(root):
     topo, seen = [], set()
 
@@ -92,7 +100,7 @@ def generate_c(root, reps=None, profile=False, fuse=False):
     for n in topo:
         size = max(1, int(np.prod(n.data.shape)))
         if not n._inputs:                                   # входной лист
-            vals = ", ".join(f"{float(x):.9g}f" for x in n.data.ravel(order="C"))
+            vals = ", ".join(_cf(x) for x in n.data.ravel(order="C"))
             decls.append(f"static float t{idx[n]}[{size}] = {{ {vals} }};")
             continue
         if n in internal:                                   # слит в потребителя
@@ -234,7 +242,7 @@ def generate_backward_c(root, named):
     for n in topo:
         size = max(1, int(np.prod(n.data.shape)))
         if not n._inputs:
-            vals = ", ".join(f"{float(x):.9g}f" for x in n.data.ravel(order="C"))
+            vals = ", ".join(_cf(x) for x in n.data.ravel(order="C"))
             decls.append(f"static float t{idx[n]}[{size}] = {{ {vals} }};")
         else:
             decls.append(f"static float t{idx[n]}[{size}];")
