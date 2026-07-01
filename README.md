@@ -21,6 +21,8 @@
 - `train_c.py` — **полный цикл обучения слоя в C**: forward+backward+SGD в BLAS
 - `mnist_c.py` — **MNIST-классификатор целиком в C+BLAS** (784→128→10, softmax),
   **97% за ~4 c**
+- `transformer_c.py` — **энкодер-блок трансформера в C+BLAS** (attention+LN+FFN),
+  сверен с Python до `~1e-6`
 - `download_mnist.py` — скачивает датасет в `data/mnist.npz`
 - `mnist.py` — MLP `784→128→10`, обучается до **~97%** за 5 эпох
 
