@@ -175,6 +175,65 @@ def demo_pipeline(n_micro=4):
           f"{np.abs(pipe - ref).max():.2e}")
 
 
+# --- 4. ZeRO / FSDP (DeepSpeed / PyTorch) -----------------------------------
+# В DDP каждая карта хранит ПОЛНУЮ копию параметров, градиентов и состояний
+# оптимизатора (Adam: m и v — ещё +2×параметров). Избыточно. ZeRO/FSDP это всё
+# ШАРДИРУЮТ: карта i держит 1/N. Для forward/backward нужные веса собирает
+# all_gather'ом и тут же освобождает; градиенты reduce_scatter — каждому его
+# шард; оптимизатор обновляет только свою 1/N. Так тренируют модели, которые в
+# одну карту не влезают в принципе.
+
+def _grads_from_flat(pflat, xb, yb, K, Nout):
+    W = Tensor(pflat[:K * Nout].reshape(K, Nout).astype(np.float32))
+    b = Tensor(pflat[K * Nout:].astype(np.float32))
+    diff = Tensor(xb) @ W + b - Tensor(yb)
+    (diff * diff).mean().backward()                  # MSE
+    return np.concatenate([W.grad.ravel(), b.grad.ravel()]).astype(np.float64)
+
+
+def demo_zero(n=4):
+    rng = np.random.default_rng(7)
+    M, K, Nout = 4 * n, 5, 3
+    X = rng.standard_normal((M, K)).astype(np.float32)
+    Y = rng.standard_normal((M, Nout)).astype(np.float32)
+    p0 = rng.standard_normal(K * Nout + Nout)         # плоский вектор параметров
+    P = p0.size
+    lr, b1, b2, eps = 1e-2, 0.9, 0.999, 1e-8
+
+    def adam_step(p, m, v, g):                        # один шаг Adam (t=1)
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        return p - lr * (m / (1 - b1)) / (np.sqrt(v / (1 - b2)) + eps), m, v
+
+    # эталон: один «GPU», полный батч, полные m, v
+    g_full = _grads_from_flat(p0, X, Y, K, Nout)
+    p_ref, _, _ = adam_step(p0, np.zeros(P), np.zeros(P), g_full)
+
+    # ZeRO-3: p, m, v, grad — всё шардировано по n устройствам
+    edges = [P * i // n for i in range(n + 1)]
+    p_sh = [p0[edges[i]:edges[i + 1]].copy() for i in range(n)]
+    m_sh = [np.zeros(edges[i + 1] - edges[i]) for i in range(n)]
+    v_sh = [np.zeros(edges[i + 1] - edges[i]) for i in range(n)]
+
+    full_p = np.concatenate(p_sh)                     # all_gather параметров
+    xs, ys = np.split(X, n), np.split(Y, n)
+    gs = [_grads_from_flat(full_p, xs[i], ys[i], K, Nout) for i in range(n)]
+    g_sh = [g / n for g in reduce_scatter(gs)]        # reduce_scatter -> шард mean-градиента
+
+    new_p = []
+    for i in range(n):                                # каждый обновляет ТОЛЬКО свою 1/N
+        pi, _, _ = adam_step(p_sh[i], m_sh[i], v_sh[i], g_sh[i])
+        new_p.append(pi)
+    p_zero = np.concatenate(new_p)                    # all_gather обновлённых весов
+
+    ddp_mem = 4 * P                                   # p+grad+m+v на КАЖДОЙ карте (DDP)
+    zero_mem = 4 * P / n                              # то же, но 1/N (ZeRO-3)
+    print(f"ZeRO-3 (n={n}): max|ZeRO - однокарточный Adam| = "
+          f"{np.abs(p_zero - p_ref).max():.2e}")
+    print(f"   память на карту: DDP={ddp_mem:.0f} ед., ZeRO-3={zero_mem:.0f} ед. "
+          f"(в {n}x меньше)")
+
+
 if __name__ == "__main__":
     print("=== Коллективы (ring all-reduce, как в NCCL) ===")
     _check_collectives()
@@ -182,5 +241,6 @@ if __name__ == "__main__":
     demo_data_parallel()
     demo_tensor_parallel()
     demo_pipeline()
+    demo_zero()
     print("\nВсё считает симулятор на CPU, но алгоритмы и семантика — настоящие\n"
           "(Megatron-LM, GPipe, PyTorch DDP, ring all-reduce из NCCL/Horovod).")
