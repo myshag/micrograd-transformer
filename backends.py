@@ -23,9 +23,27 @@ import os
 import numpy as np
 
 
-class NumpyBackend:
-    """Эталонный бэкенд на numpy. Все операции над host-массивами."""
+def _sum_to(grad, shape, xp):
+    """Свернуть grad к форме shape по осям, размноженным broadcasting'ом
+    (обобщение _unbroadcast для любого backend-модуля: numpy или cupy)."""
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for axis, dim in enumerate(shape):
+        if dim == 1 and grad.shape[axis] != 1:
+            grad = grad.sum(axis=axis, keepdims=True)
+    return grad
 
+
+class NumpyBackend:
+    """Эталонный бэкенд на numpy. Все операции над host-массивами.
+
+    forward и backward — обе стороны на устройстве: методы *_grad считают
+    градиент активаций, transpose_last2/sum_to нужны backward'у matmul и +/*.
+    """
+
+    xp = np
+
+    # --- forward ---
     def matmul(self, a, b):
         return a @ b
 
@@ -43,6 +61,22 @@ class NumpyBackend:
 
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
+
+    # --- backward (тоже на устройстве) ---
+    def transpose_last2(self, x):
+        return self.xp.swapaxes(x, -1, -2)
+
+    def sum_to(self, grad, shape):
+        return _sum_to(grad, shape, self.xp)
+
+    def relu_grad(self, x, gy):
+        return (x > 0) * gy
+
+    def tanh_grad(self, t, gy):
+        return (1 - t * t) * gy
+
+    def sigmoid_grad(self, s, gy):
+        return s * (1 - s) * gy
 
 
 # --- CUDA-бэкенд (симулятор Numba) ------------------------------------------
@@ -100,8 +134,28 @@ def _load_kernels():
             if i < o.size:
                 o[i] = 1.0 / (1.0 + math.exp(-x[i]))
 
+        # backward-кернелы активаций: o = grad_вход по значению forward и gy
+        @cuda.jit
+        def _grelu(o, x, gy):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = gy[i] if x[i] > 0.0 else 0.0
+
+        @cuda.jit
+        def _gtanh(o, t, gy):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = (1.0 - t[i] * t[i]) * gy[i]
+
+        @cuda.jit
+        def _gsigmoid(o, s, gy):
+            i = _nbcuda.grid(1)
+            if i < o.size:
+                o[i] = s[i] * (1.0 - s[i]) * gy[i]
+
         _kernels = dict(mm=_mm, add=_add, mul=_mul,
-                        relu=_relu, tanh=_tanh, sigmoid=_sigmoid)
+                        relu=_relu, tanh=_tanh, sigmoid=_sigmoid,
+                        grelu=_grelu, gtanh=_gtanh, gsigmoid=_gsigmoid)
     return _kernels
 
 
@@ -155,6 +209,18 @@ class CudaSimBackend(NumpyBackend):
 
     def sigmoid(self, x):
         return _launch_unary("sigmoid", x)
+
+    # backward активаций — через grad-кернелы (x и gy одной формы)
+    def relu_grad(self, x, gy):
+        return _launch_binary("grelu", x, gy)
+
+    def tanh_grad(self, t, gy):
+        return _launch_binary("gtanh", t, gy)
+
+    def sigmoid_grad(self, s, gy):
+        return _launch_binary("gsigmoid", s, gy)
+    # transpose_last2 / sum_to наследуем от NumpyBackend (для симулятора это
+    # тот же numpy; настоящий GPU переопределил бы их через cupy).
 
 
 # --- Настоящий CUDA-бэкенд через .cu-ядра (нужен GPU + CuPy) -----------------
@@ -223,6 +289,15 @@ class RealCudaBackend(NumpyBackend):
 
     def sigmoid(self, x):
         return self._ew("ew_sigmoid", x)
+
+    def relu_grad(self, x, gy):
+        return self._ew("grad_relu", x, gy)
+
+    def tanh_grad(self, t, gy):
+        return self._ew("grad_tanh", t, gy)
+
+    def sigmoid_grad(self, s, gy):
+        return self._ew("grad_sigmoid", s, gy)
 
 
 BACKENDS = {

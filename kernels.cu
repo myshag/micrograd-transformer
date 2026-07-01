@@ -48,3 +48,22 @@ void ew_sigmoid(const float* x, float* o, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) o[i] = 1.0f / (1.0f + expf(-x[i]));
 }
+
+// backward активаций: o = градиент по входу (по forward-значению и gy)
+extern "C" __global__
+void grad_relu(const float* x, const float* gy, float* o, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] = x[i] > 0.0f ? gy[i] : 0.0f;
+}
+
+extern "C" __global__
+void grad_tanh(const float* t, const float* gy, float* o, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] = (1.0f - t[i] * t[i]) * gy[i];
+}
+
+extern "C" __global__
+void grad_sigmoid(const float* s, const float* gy, float* o, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] = s[i] * (1.0f - s[i]) * gy[i];
+}

@@ -177,13 +177,13 @@ class Tensor:
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
         assert self.device == other.device, (
             f"тензоры на разных устройствах: {self.device} и {other.device}")
-        result = backends.get_backend(self.device).add(self.data, other.data)
-        out = Tensor(result, (self, other), "+")
+        B = backends.get_backend(self.device)
+        out = Tensor(B.add(self.data, other.data), (self, other), "+")
 
         def _backward():
             # Градиент сложения проходит как есть, но с поправкой на broadcasting.
-            self.grad += _unbroadcast(out.grad, self.data.shape)
-            other.grad += _unbroadcast(out.grad, other.data.shape)
+            self.grad += B.sum_to(out.grad, self.data.shape)
+            other.grad += B.sum_to(out.grad, other.data.shape)
 
         out._set_backward(_backward)
         return out
@@ -192,12 +192,12 @@ class Tensor:
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
         assert self.device == other.device, (
             f"тензоры на разных устройствах: {self.device} и {other.device}")
-        result = backends.get_backend(self.device).mul(self.data, other.data)
-        out = Tensor(result, (self, other), "*")
+        B = backends.get_backend(self.device)
+        out = Tensor(B.mul(self.data, other.data), (self, other), "*")
 
         def _backward():
-            self.grad += _unbroadcast(other.data * out.grad, self.data.shape)
-            other.grad += _unbroadcast(self.data * out.grad, other.data.shape)
+            self.grad += B.sum_to(B.mul(other.data, out.grad), self.data.shape)
+            other.grad += B.sum_to(B.mul(self.data, out.grad), other.data.shape)
 
         out._set_backward(_backward)
         return out
@@ -212,17 +212,16 @@ class Tensor:
         """
         assert self.device == other.device, (
             f"тензоры на разных устройствах: {self.device} и {other.device}")
-        result = backends.get_backend(self.device).matmul(self.data, other.data)
-        out = Tensor(result, (self, other), "@")
+        B = backends.get_backend(self.device)
+        out = Tensor(B.matmul(self.data, other.data), (self, other), "@")
 
         def _backward():
-            # Для C = A @ B:  dA = dC @ Bᵀ,  dB = Aᵀ @ dC.
-            # Транспонируем только две последние оси (батчи не трогаем),
-            # а _unbroadcast сворачивает оси, размноженные broadcasting'ом.
-            ga = out.grad @ np.swapaxes(other.data, -1, -2)
-            gb = np.swapaxes(self.data, -1, -2) @ out.grad
-            self.grad += _unbroadcast(ga, self.data.shape)
-            other.grad += _unbroadcast(gb, other.data.shape)
+            # Для C = A @ B:  dA = dC @ Bᵀ,  dB = Aᵀ @ dC — тоже через бэкенд
+            # (на настоящем GPU обратный проход считался бы там же).
+            ga = B.matmul(out.grad, B.transpose_last2(other.data))
+            gb = B.matmul(B.transpose_last2(self.data), out.grad)
+            self.grad += B.sum_to(ga, self.data.shape)
+            other.grad += B.sum_to(gb, other.data.shape)
 
         out._set_backward(_backward)
         return out
@@ -231,33 +230,35 @@ class Tensor:
         return self.matmul(other)
 
     def relu(self):
-        data = backends.get_backend(self.device).relu(self.data)
-        out = Tensor(data, (self,), "relu")
+        B = backends.get_backend(self.device)
+        out = Tensor(B.relu(self.data), (self,), "relu")
 
         def _backward():
-            # производная: 1 там, где вход был > 0, иначе 0
-            self.grad += (self.data > 0) * out.grad
+            # производная: 1 там, где вход был > 0, иначе 0 — на устройстве
+            self.grad += B.relu_grad(self.data, out.grad)
 
         out._set_backward(_backward)
         return out
 
     def tanh(self):
-        t = backends.get_backend(self.device).tanh(self.data)
+        B = backends.get_backend(self.device)
+        t = B.tanh(self.data)
         out = Tensor(t, (self,), "tanh")
 
         def _backward():
-            self.grad += (1 - t ** 2) * out.grad
+            self.grad += B.tanh_grad(t, out.grad)
 
         out._set_backward(_backward)
         return out
 
     def sigmoid(self):
-        s = backends.get_backend(self.device).sigmoid(self.data)
+        B = backends.get_backend(self.device)
+        s = B.sigmoid(self.data)
         out = Tensor(s, (self,), "sigmoid")
 
         def _backward():
-            # d/dx sigmoid = sigmoid * (1 - sigmoid)
-            self.grad += s * (1 - s) * out.grad
+            # d/dx sigmoid = sigmoid * (1 - sigmoid) — на устройстве
+            self.grad += B.sigmoid_grad(s, out.grad)
 
         out._set_backward(_backward)
         return out
