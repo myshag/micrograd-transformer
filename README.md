@@ -23,6 +23,8 @@
 - `pythia.py` — **настоящая LLM (Pythia-70M, GPT-NeoX) на нашем движке,
   ДИФФЕРЕНЦИРУЕМАЯ**: RoPE через slice/cat, объединённый QKV, parallel residual,
   GELU. Forward И backward сверены с torch.autograd HF до ~1e-5 (float64)
+- `interpret.py` — **интерпретируемость LLM**: 2D-проекция эмбеддингов (PCA),
+  карта внимания (attention sink), logit lens (предсказание по слоям) на Pythia
 - `torch_compare.py` — **сверка с PyTorch** (оракул): точность (градиенты `~1e-8`)
   и скорость (PyTorch ~2.8× быстрее на CPU)
 - `jit_compare.py` — наш C+BLAS vs PyTorch eager vs `torch.compile` (native-код
