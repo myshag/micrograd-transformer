@@ -123,6 +123,9 @@ class Tensor:
         self.grad = np.zeros_like(self.data) if _grad_enabled else None
         self._backward = lambda: None
         self._prev = set(_children) if _grad_enabled else set()
+        # Упорядоченные входы (с порядком и кратностью) — нужны компилятору
+        # графа в C (compile_blas.py). Множество _prev это теряет.
+        self._inputs = tuple(_children)
         self._op = _op
 
     def _set_backward(self, fn):
@@ -444,6 +447,7 @@ class Tensor:
         for v in topo:
             v._backward = _noop
             v._prev = _EMPTY
+            v._inputs = ()
 
     # --- Сахар --------------------------------------------------------------
 
