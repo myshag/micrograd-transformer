@@ -35,7 +35,8 @@
 - `primes.py` — мини-GPT, который **генерирует простые числа**
 - `primes_memorize.py` — 100% train через запоминание (урок про overfitting)
 - `attention_viz.py` — тепловая карта матрицы внимания softmax(QKᵀ)
-- `text.py` — char-level GPT на тексте (Shakespeare), генерирует текст
+- `text.py` — char-level GPT на тексте (Shakespeare / Пушкин), генерирует текст
+- `download_pushkin.py` — русский корпус (Онегин + Капитанская дочка)
 - 📘 **`docs/transformer-from-scratch.md`** — учебник: трансформер с нуля
 
 ## Запуск
