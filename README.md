@@ -33,6 +33,7 @@
 - `nn.py` — `Embedding`, `LayerNorm`, `MultiheadAttention`,
   `TransformerEncoderLayer`, `TransformerEncoder` (+ каузальный маск)
 - `primes.py` — мини-GPT, который **генерирует простые числа**
+- `primes_memorize.py` — 100% train через запоминание (урок про overfitting)
 - 📘 **`docs/transformer-from-scratch.md`** — учебник: трансформер с нуля
 
 ## Запуск
